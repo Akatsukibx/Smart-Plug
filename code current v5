@@ -1,0 +1,345 @@
+/* Smart Plug – Stable current v3.7.2
+   - active-guard + freeze-base
+   - rise detector (fast-unclamp) + drip-zero-on
+   - bi-AutoK + simultaneous solve + dominant-guard
+*/
+
+#include "thingProperties.h"
+#include <Arduino.h>
+#include <math.h>
+
+/*** Pins / Board ***/
+#ifndef SWAP_AB
+#define SWAP_AB 0
+#endif
+#define PIN_A2 A3
+#define PIN_A3 A2
+#if SWAP_AB
+  #define ADC_I_A PIN_A3
+  #define ADC_I_B PIN_A2
+#else
+  #define ADC_I_A PIN_A2
+  #define ADC_I_B PIN_A3
+#endif
+#define ADC_I_ALL A6
+
+#ifndef D2
+#define D2 2
+#endif
+#ifndef D5
+#define D5 5
+#endif
+#define RELAY_A_PIN D2
+#define RELAY_B_PIN D5
+const bool RELAY_ACTIVE_LOW=false;
+
+/*** Options ***/
+#define RELAY_GATING true
+enum AllMode{ MODE_SUM=0, MODE_CT=1 }; AllMode allMode=MODE_SUM;
+
+/*** ADC & scales ***/
+static const float ADC_REF=3.30f; static const int ADC_MAX=4095;
+#define ACS712_V_PER_A 0.024f
+static const float V_PER_A_A   = ACS712_V_PER_A;
+static const float V_PER_A_B   = ACS712_V_PER_A;
+static const float V_PER_A_ALL = 0.033f;
+
+/*** Filters & thresholds ***/
+static const float EMA_ALPHA_OUT=0.25f, HPF_ALPHA=0.01f;
+static const float DZ_A=0.01f, DZ_B=0.03f, DZ_CT=0.02f;
+static const float DZ_AFTER_COMP=0.02f;
+#define NO_LOAD_THRESHOLD 0.025f
+
+// idle thresholds (tuned)
+#define SIDE_IDLE_RAW   0.35f
+#define SIDE_IDLE_I     0.14f
+#define OTHER_ACTIVE_I  0.18f
+#define SIDE_IDLE_HOLD  1500
+
+// both idle (when relays both OFF only)
+#define BOTH_IDLE_RAW   0.28f
+#define BOTH_IDLE_I     0.05f
+#define BOTH_IDLE_HOLD  1000
+
+// activity detector + guard
+#define ACTIVATE_I       0.15f
+#define RELEASE_I        0.08f
+#define ACTIVATE_COUNT   4
+#define RELEASE_COUNT    6
+#define ACTIVE_HOLD_MS   4000
+
+// FAST UNCLAMP on sudden rise
+#define RISE_TRIG_I      0.18f
+#define RISE_FRAMES      2
+#define UNCLAMP_HOLD_MS  2500
+
+// DRIP-ZERO while relay ON but clearly idle
+#define DRIP_ON_DELAY_MS 5000
+#define DRIP_ON_ALPHA    0.05f
+
+/*** Helpers ***/
+static inline float adcToVolt(int a){ return (a*ADC_REF)/(float)ADC_MAX; }
+static inline float ema(float p,float x,float a){ return a*x + (1.0f-a)*p; }
+static inline float deadzone(float x,float dz){ return (fabsf(x)<dz)?0.0f:x; }
+static inline float round2(float x){ return roundf(x*100.0f)/100.0f; }
+static inline float floorToZero(float x,float eps=2e-3f){ return (fabsf(x)<eps)?0.0f:x; }
+
+/*** HPF offsets ***/
+float offA=ADC_REF/2, offB=ADC_REF/2, offAll=ADC_REF/2;
+
+/*** Irms HPF ***/
+static float readIrmsHPF(int pin,float &off,float v_per_A){
+  const uint32_t T=120, t0=millis(); double s=0; uint32_t n=0;
+  while(millis()-t0<T){
+    float v=adcToVolt(analogRead(pin));
+    off=ema(off,v,HPF_ALPHA);
+    float ac=v-off; s += (double)ac*ac; n++; yield();
+  }
+  if(!n) return 0.0f;
+  float Vrms=sqrt(s/(double)n);
+  return Vrms/v_per_A;
+}
+
+/*** Cal/Zero ***/
+float calA=1.0f, calB=1.0f;
+float baseA=0.0f, baseB=0.0f;
+static void doZero(){
+  double sA=0,sB=0; int n=0; uint32_t t0=millis();
+  while(millis()-t0<1200){
+    sA+=readIrmsHPF(ADC_I_A,offA,V_PER_A_A)*calA;
+    sB+=readIrmsHPF(ADC_I_B,offB,V_PER_A_B)*calB;
+    n++; delay(5);
+  }
+  baseA=constrain((float)(sA/(n?n:1)),0.0f,0.5f);
+  baseB=constrain((float)(sB/(n?n:1)),0.0f,0.5f);
+  Serial.printf("[Zero] baseA=%.3f baseB=%.3f\n",baseA,baseB);
+}
+
+/*** Bi-AutoK (kept) ***/
+bool  compEnabled=true;
+float K_BA=0.40f, K_AB=0.40f;
+const float K_ALPHA=0.30f;
+static uint32_t kLogMs=0;
+static void learnK_BA(float iA,float iB,float A_raw,float B_raw){
+  if(relayA && (B_raw<0.06f) && (iB<0.03f) && iA>0.10f){
+    float r=(iA>0.001f)?(iB/iA):0.0f; r=constrain(r,0.0f,0.90f);
+    K_BA=ema(K_BA,r,K_ALPHA);
+    if(!kLogMs || millis()-kLogMs>3000){ Serial.printf("[AutoK_BA] K_BA=%.3f\n",K_BA); kLogMs=millis(); }
+  }
+}
+static void learnK_AB(float iA,float iB,float A_raw,float B_raw){
+  if(relayB && (A_raw<0.06f) && (iA<0.03f) && iB>0.10f){
+    float r=(iB>0.001f)?(iA/iB):0.0f; r=constrain(r,0.0f,0.90f);
+    K_AB=ema(K_AB,r,K_ALPHA);
+    if(!kLogMs || millis()-kLogMs>3000){ Serial.printf("[AutoK_AB] K_AB=%.3f\n",K_AB); kLogMs=millis(); }
+  }
+}
+
+/*** States ***/
+uint32_t bothIdleTs=0;
+int actCntA=0, relCntA=0, actCntB=0, relCntB=0;
+bool activeA=false, activeB=false;
+uint32_t activeUntilA=0, activeUntilB=0;
+
+// fast-unclamp + drip-zero timers
+int riseCntA=0, riseCntB=0;
+uint32_t unclampUntilA=0, unclampUntilB=0;
+uint32_t onIdleSinceA=0, onIdleSinceB=0;
+
+/*** Outputs ***/
+float iA_o=0.0f, iB_o=0.0f, iAll_o=0.0f;
+
+void setup(){
+  Serial.begin(115200); delay(300);
+  pinMode(RELAY_A_PIN,OUTPUT); pinMode(RELAY_B_PIN,OUTPUT);
+  bool offLevel=RELAY_ACTIVE_LOW?HIGH:LOW;
+  digitalWrite(RELAY_A_PIN,offLevel); digitalWrite(RELAY_B_PIN,offLevel);
+
+  analogReadResolution(12); analogSetAttenuation(ADC_11db);
+
+  initProperties();
+  ArduinoCloud.begin(ArduinoIoTPreferredConnection);
+  setDebugMessageLevel(2);
+  ArduinoCloud.printDebugInfo();
+
+  Serial.println("[INFO] v3.7.2 rise-detector + drip-zero-on");
+
+  // boot zero only if really idle
+  double sA=0,sB=0; int n=0; uint32_t t0=millis();
+  while(millis()-t0<800){ sA+=readIrmsHPF(ADC_I_A,offA,V_PER_A_A); sB+=readIrmsHPF(ADC_I_B,offB,V_PER_A_B); n++; delay(5); }
+  if((sA/n)<0.20f && (sB/n)<0.20f) doZero();
+}
+
+void loop(){
+  ArduinoCloud.update();
+
+  float A_raw=readIrmsHPF(ADC_I_A,offA,V_PER_A_A)*calA;
+  float B_raw=readIrmsHPF(ADC_I_B,offB,V_PER_A_B)*calB;
+  float CT_raw=readIrmsHPF(ADC_I_ALL,offAll,V_PER_A_ALL);
+
+  baseA=constrain(baseA,0.0f,0.5f);
+  baseB=constrain(baseB,0.0f,0.5f);
+
+  // pre-comp currents
+  float iA=A_raw-baseA; if(iA<0)iA=0; iA=deadzone(iA,DZ_A); if(iA<NO_LOAD_THRESHOLD)iA=0;
+  float iB=B_raw-baseB; if(iB<0)iB=0; iB=deadzone(iB,DZ_B); if(iB<NO_LOAD_THRESHOLD)iB=0;
+  if(RELAY_GATING){ if(!relayA) iA=0; if(!relayB) iB=0; }
+
+  // ---- activity detector (hysteresis) ----
+  if(iA>ACTIVATE_I){ if(++actCntA>=ACTIVATE_COUNT){ activeA=true; activeUntilA=millis()+ACTIVE_HOLD_MS; relCntA=0; } }
+  else if(iA<RELEASE_I){ if(++relCntA>=RELEASE_COUNT && millis()>activeUntilA){ activeA=false; actCntA=0; } }
+
+  if(iB>ACTIVATE_I){ if(++actCntB>=ACTIVATE_COUNT){ activeB=true; activeUntilB=millis()+ACTIVE_HOLD_MS; relCntB=0; } }
+  else if(iB<RELEASE_I){ if(++relCntB>=RELEASE_COUNT && millis()>activeUntilB){ activeB=false; actCntB=0; } }
+
+  // ---- RISE DETECTOR: fast unclamp for new load ----
+  if(iA>RISE_TRIG_I){ if(++riseCntA>=RISE_FRAMES){ unclampUntilA=millis()+UNCLAMP_HOLD_MS; activeA=true; } }
+  else riseCntA=0;
+  if(iB>RISE_TRIG_I){ if(++riseCntB>=RISE_FRAMES){ unclampUntilB=millis()+UNCLAMP_HOLD_MS; activeB=true; } }
+  else riseCntB=0;
+
+  // learn K in safe windows
+  learnK_BA(iA,iB,A_raw,B_raw);
+  learnK_AB(iA,iB,A_raw,B_raw);
+
+  // ---- simultaneous solve + guards ----
+  float eps=1e-6f;
+  float kBA_eff=max(0.0f,K_BA-0.05f);
+  float kAB_eff=max(0.0f,K_AB-0.05f);
+
+  const float DOM_RATIO=2.0f;
+  float rAB=(iB>eps)?(iA/(iB+eps)):999.0f;
+  float rBA=(iA>eps)?(iB/(iA+eps)):999.0f;
+  if(rAB>DOM_RATIO) kBA_eff=0.0f;
+  if(rBA>DOM_RATIO) kAB_eff=0.0f;
+
+  const float CAP_FRAC=0.05f, CAP_ABS=0.01f;
+  float maxSubB=min(CAP_FRAC*iB,CAP_ABS); if(iA>eps) kBA_eff=min(kBA_eff, maxSubB/(iA+eps));
+  float maxSubA=min(CAP_FRAC*iA,CAP_ABS); if(iB>eps) kAB_eff=min(kAB_eff, maxSubA/(iB+eps));
+
+  float denom=1.0f-kAB_eff*kBA_eff; if(denom<0.70f) denom=0.70f;
+  float IA=(iA - kAB_eff*iB)/denom;
+  float IB=(iB - kBA_eff*iA)/denom;
+  if(IA<0) IA=0; if(IB<0) IB=0;
+
+  // ---- side-idle clamp (skip when active or fast-unclamp) ----
+  bool otherActiveA=(IB>OTHER_ACTIVE_I);
+  bool otherActiveB=(IA>OTHER_ACTIVE_I);
+
+  bool allowClampA = !(activeA || (millis()<unclampUntilA));
+  bool allowClampB = !(activeB || (millis()<unclampUntilB));
+
+  if(allowClampA && ( !relayA ||
+                      (A_raw<SIDE_IDLE_RAW && IA<SIDE_IDLE_I) ||
+                      (otherActiveA && IA<SIDE_IDLE_I) ))
+    IA=0.0f;
+
+  if(allowClampB && ( !relayB ||
+                      (B_raw<SIDE_IDLE_RAW && IB<SIDE_IDLE_I) ||
+                      (otherActiveB && IB<SIDE_IDLE_I) ))
+    IB=0.0f;
+
+  if(IA<DZ_AFTER_COMP) IA=0.0f;
+  if(IB<DZ_AFTER_COMP) IB=0.0f;
+
+  // ---- soft-zero / base update ----
+  static uint32_t tsA=0, tsB=0;
+
+  // (a) relay OFF: normal soft-zero
+  if(!relayA && IA==0.0f && A_raw<SIDE_IDLE_RAW){
+    if(!tsA) tsA=millis();
+    if(millis()-tsA>SIDE_IDLE_HOLD){ baseA=constrain(0.85f*baseA+0.15f*A_raw,0.0f,0.5f); tsA=millis(); Serial.printf("[SideZero] baseA->%.3f (Araw=%.3f)\n",baseA,A_raw); }
+  } else tsA=0;
+
+  if(!relayB && IB==0.0f && B_raw<SIDE_IDLE_RAW){
+    if(!tsB) tsB=millis();
+    if(millis()-tsB>SIDE_IDLE_HOLD){ baseB=constrain(0.85f*baseB+0.15f*B_raw,0.0f,0.5f); tsB=millis(); Serial.printf("[SideZero] baseB->%.3f (Braw=%.3f)\n",baseB,B_raw); }
+  } else tsB=0;
+
+  // (b) relay ON but clearly idle -> drip-zero (ช้ามาก ป้องกันค้าง)
+  if(relayA && !activeA && IA==0.0f && A_raw<SIDE_IDLE_RAW){
+    if(!onIdleSinceA) onIdleSinceA=millis();
+    if(millis()-onIdleSinceA>DRIP_ON_DELAY_MS){
+      baseA=constrain((1.0f-DRIP_ON_ALPHA)*baseA + DRIP_ON_ALPHA*A_raw, 0.0f, 0.5f);
+    }
+  } else onIdleSinceA=0;
+
+  if(relayB && !activeB && IB==0.0f && B_raw<SIDE_IDLE_RAW){
+    if(!onIdleSinceB) onIdleSinceB=millis();
+    if(millis()-onIdleSinceB>DRIP_ON_DELAY_MS){
+      baseB=constrain((1.0f-DRIP_ON_ALPHA)*baseB + DRIP_ON_ALPHA*B_raw, 0.0f, 0.5f);
+    }
+  } else onIdleSinceB=0;
+
+  // ---- both-idle hard-zero (only when BOTH relays OFF) ----
+  if(!relayA && !relayB &&
+     (A_raw<BOTH_IDLE_RAW && B_raw<BOTH_IDLE_RAW) &&
+     IA==0.0f && IB==0.0f)
+  {
+    if(!bothIdleTs) bothIdleTs=millis();
+    if(millis()-bothIdleTs>BOTH_IDLE_HOLD){
+      baseA=constrain(0.85f*baseA+0.15f*A_raw,0.0f,0.5f);
+      baseB=constrain(0.85f*baseB+0.15f*B_raw,0.0f,0.5f);
+      bothIdleTs=millis();
+      Serial.println("[BothIdle] hard-zero (both OFF)");
+    }
+  } else bothIdleTs=0;
+
+  // publish
+  float iAll=(allMode==MODE_SUM)?(IA+IB):deadzone(CT_raw,DZ_CT);
+  iA_o=ema(iA_o,IA,EMA_ALPHA_OUT);
+  iB_o=ema(iB_o,IB,EMA_ALPHA_OUT);
+  iAll_o=ema(iAll_o,iAll,EMA_ALPHA_OUT);
+
+  currentA=round2(floorToZero(iA_o));
+  currentB=round2(floorToZero(iB_o));
+  currentAll=round2(floorToZero(iAll_o));
+
+  Serial.printf("Araw=%.3f baseA=%.3f actA=%d | Brow=%.3f baseB=%.3f actB=%d | IA=%.3f IB=%.3f | unclampA=%d unclampB=%d | PUB=%.2f,%.2f,%.2f\n",
+                A_raw,baseA,(int)activeA, B_raw,baseB,(int)activeB, IA,IB,
+                (int)(millis()<unclampUntilA),(int)(millis()<unclampUntilB),
+                currentA,currentB,currentAll);
+
+  delay(300);
+}
+
+/*** Cloud (ย่อ) ***/
+void onMsgCommandChange(){
+  if(!msgCommand.length()) return;
+  String s=msgCommand; s.trim(); s.toUpperCase();
+  if(s=="ZERO"){ doZero(); }
+  if(s=="MODE SUM"){ allMode=MODE_SUM; }
+  if(s=="MODE CT"){  allMode=MODE_CT;  }
+  if(s=="COMP ON"){  compEnabled=true; }
+  if(s=="COMP OFF"){ compEnabled=false; }
+  if(s.startsWith("CAL A =")){
+    float t=s.substring(8).toFloat();
+    float m=readIrmsHPF(ADC_I_A,offA,V_PER_A_A);
+    if(m>0.0005f){ calA=t/m; Serial.printf("[Cal] calA=%.4f\n",calA); }
+  }
+  if(s.startsWith("CAL B =")){
+    float t=s.substring(8).toFloat();
+    float m=readIrmsHPF(ADC_I_B,offB,V_PER_A_B);
+    if(m>0.0005f){ calB=t/m; Serial.printf("[Cal] calB=%.4f\n",calB); }
+  }
+  if(s.indexOf("A ON")>=0){ relayA=true;  onRelayAChange(); }
+  if(s.indexOf("A OFF")>=0){ relayA=false; onRelayAChange(); }
+  if(s.indexOf("B ON")>=0){ relayB=true;  onRelayBChange(); }
+  if(s.indexOf("B OFF")>=0){ relayB=false; onRelayBChange(); }
+}
+
+void onRelayAChange(){
+  bool level=RELAY_ACTIVE_LOW? !relayA:relayA;
+  digitalWrite(RELAY_A_PIN, level?HIGH:LOW);
+  if(!relayA && RELAY_GATING){ currentA=iA_o=0.0f; activeA=false; unclampUntilA=0; }
+  Serial.printf("[Cloud] Relay A -> %s\n", relayA? "ON":"OFF");
+}
+void onRelayBChange(){
+  bool level=RELAY_ACTIVE_LOW? !relayB:relayB;
+  digitalWrite(RELAY_B_PIN, level?HIGH:LOW);
+  if(!relayB && RELAY_GATING){ currentB=iB_o=0.0f; activeB=false; unclampUntilB=0; }
+  Serial.printf("[Cloud] Relay B -> %s\n", relayB? "ON":"OFF");
+}
+void onResetEnergyChange(){
+  if(resetEnergy){ resetEnergy=false; Serial.println("[Cloud] Energy reset."); }
+}
