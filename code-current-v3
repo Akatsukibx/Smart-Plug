@@ -1,0 +1,388 @@
+/* Smart Plug – Stable current v2 (Full + Auto Soft-Zero)
+   - Deadzone ต่ำ, AZ ON/OFF, ฟลัชค่าเล็กเป็น 0.00
+   - Boot ZERO/Auto-Zero เหมาะกับ baseline ที่ค่อนข้างสูง
+   - Auto Soft-Zero: ปิดรีเลย์ + idle ต่อเนื่อง → ZERO อัตโนมัติ
+*/
+
+#include "thingProperties.h"
+#include <Arduino.h>
+#include <math.h>
+
+// ====== Forward declarations (Cloud callbacks) ======
+void onRelayAChange();
+void onRelayBChange();
+void onResetEnergyChange();
+void onMsgCommandChange();
+
+#ifndef SWAP_AB
+#define SWAP_AB 0
+#endif
+
+/*** Pins ***/
+// สลับพิน A2/A3 ตามบอร์ด
+#define PIN_A2 A3
+#define PIN_A3 A2
+
+#if SWAP_AB
+  #define ADC_I_A PIN_A3
+  #define ADC_I_B PIN_A2
+#else
+  #define ADC_I_A PIN_A2
+  #define ADC_I_B PIN_A3
+#endif
+#define ADC_I_ALL A6  // ถ้าใช้ CT รวม
+
+#ifndef D2
+#define D2 2
+#endif
+#ifndef D5
+#define D5 5
+#endif
+#define RELAY_A_PIN D2
+#define RELAY_B_PIN D5
+const bool RELAY_ACTIVE_LOW = false;
+
+/*** Options ***/
+#define RELAY_GATING true
+enum AllMode { MODE_SUM = 0, MODE_CT = 1 };
+AllMode allMode = MODE_SUM;
+
+/*** ADC & sensor scales ***/
+static const float ADC_REF = 3.30f;
+static const int   ADC_MAX = 4095;
+#define ACS712_V_PER_A 0.024f
+static const float V_PER_A_A   = ACS712_V_PER_A;
+static const float V_PER_A_B   = ACS712_V_PER_A;
+static const float V_PER_A_ALL = 0.033f;
+
+/*** Filters & deadzones ***/
+static const float EMA_ALPHA_OUT = 0.25f;
+static const float HPF_ALPHA     = 0.01f;
+static const float DZ_A   = 0.01f;   // เดิม 0.05
+static const float DZ_B   = 0.01f;   // เดิม 0.05
+static const float DZ_CT  = 0.02f;
+static const float DZ_B_COMP = 0.03f;
+
+/*** Helpers ***/
+static inline float adcToVolt(int adc){ return (adc * ADC_REF) / (float)ADC_MAX; }
+static inline float ema(float prev, float now, float a){ return a*now + (1.0f-a)*prev; }
+static inline float deadzone(float x, float dz){ return (fabsf(x) < dz) ? 0.0f : x; }
+
+/*** HPF states ***/
+float offA = ADC_REF/2, offB = ADC_REF/2, offAll = ADC_REF/2;
+
+/*** Read Irms with HPF ***/
+static float readIrmsHPF(int pin, float &off, float v_per_A){
+  const uint32_t window_ms = 120;   // ~6 คาบ @50Hz
+  const uint32_t t0 = millis();
+  double sumSq = 0.0;
+  uint32_t n=0;
+  while (millis()-t0 < window_ms){
+    float v = adcToVolt(analogRead(pin));
+    off = ema(off, v, HPF_ALPHA);
+    float ac = v - off;
+    sumSq += (double)ac * (double)ac;
+    n++;
+  }
+  if (!n) return 0.0f;
+  float Vrms = sqrt(sumSq/(double)n);
+  return Vrms / v_per_A;
+}
+
+/*** Calibrations & Zero ***/
+float calA = 1.00f, calB = 1.00f;
+float baseA = 0.0f, baseB = 0.0f;
+
+static void doZero(){
+  double sA=0, sB=0; int n=0; uint32_t t0=millis();
+  while (millis()-t0 < 1200) {
+    sA += readIrmsHPF(ADC_I_A, offA, V_PER_A_A) * calA;
+    sB += readIrmsHPF(ADC_I_B, offB, V_PER_A_B) * calB;
+    n++; delay(40);
+  }
+  baseA = sA/(n?n:1);
+  baseB = sB/(n?n:1);
+  if (baseA<0) baseA=0; if (baseB<0) baseB=0;
+  if (baseA>0.5) baseA=0; if (baseB>0.5) baseB=0;
+  Serial.printf("[Zero] baseA=%.4f baseB=%.4f\n", baseA, baseB);
+}
+
+// Boot ZERO ยอมรับ idle ได้สูงขึ้น
+static void bootZeroIfIdle(){
+  double sA=0, sB=0; int n=0; uint32_t t0=millis();
+  while (millis()-t0 < 800){
+    sA += readIrmsHPF(ADC_I_A, offA, V_PER_A_A);
+    sB += readIrmsHPF(ADC_I_B, offB, V_PER_A_B);
+    n++; delay(30);
+  }
+  float ar = (float)(sA/(n?n:1))*calA;
+  float br = (float)(sB/(n?n:1))*calB;
+  if (ar < 0.20f && br < 0.20f) {   // เดิม 0.08
+    doZero();
+    Serial.printf("[BootZero] idle (A=%.3f,B=%.3f) -> ZERO\n", ar, br);
+  } else {
+    Serial.printf("[BootZero] skip (A=%.3f,B=%.3f)\n", ar, br);
+  }
+}
+
+/*** Leak compensation ***/
+bool  compEnabled = false;
+float leakK_BA    = 1.00f;
+const float LEAK_A_MIN = 0.08f;
+const float LEAK_B_MAX = 0.03f;
+const uint32_t LEAK_HOLD_MS = 3000;
+uint32_t leakStartMs = 0;
+static void leakAutoCal(float iA, float iB_comp){
+  if (!compEnabled){ leakStartMs = 0; return; }
+  if (iA > LEAK_A_MIN && iB_comp < LEAK_B_MAX){
+    if (!leakStartMs) leakStartMs = millis();
+    if (millis() - leakStartMs > LEAK_HOLD_MS){
+      double sumA=0, sumB=0; int n=0;
+      const uint32_t t0 = millis();
+      while (millis()-t0 < 600){
+        sumA += readIrmsHPF(ADC_I_A, offA, V_PER_A_A)*calA - baseA;
+        sumB += readIrmsHPF(ADC_I_B, offB, V_PER_A_B)*calB - baseB;
+        n++; delay(50);
+      }
+      if (n>0){
+        float Aavg = (float)(sumA / n);
+        float Bavg = (float)(sumB / n);
+        if (Aavg < 0.0f) Aavg = 0.0f;
+        if (Bavg < 0.0f) Bavg = 0.0f;
+        if (Aavg > 0.02f){
+          leakK_BA = constrain(Bavg / Aavg, 0.0f, 3.0f);
+          Serial.printf("[AutoLeak] K=%.3f (Aavg=%.3f, Bavg=%.3f)\n", leakK_BA, Aavg, Bavg);
+        }
+      }
+      leakStartMs = 0;
+    }
+  } else {
+    leakStartMs = 0;
+  }
+}
+
+/*** Auto-Zero Control ***/
+#define NO_LOAD_THRESHOLD   0.005f
+#define IDLE_RAW_THRESH     0.15f   // เดิม 0.03 → มองว่า idle ได้ถึง ~0.15A
+#define IDLE_HOLD_MS        3000    // นิ่ง 3s จึงเลื่อนฐาน
+uint32_t idleSinceMs = 0;
+bool autoZeroEnabled = true;
+
+static void autoZeroIfIdle(float A_raw, float B_raw){
+  if (!autoZeroEnabled) { idleSinceMs = 0; return; }
+  if (relayA || relayB) { idleSinceMs = 0; return; }  // มีรีเลย์ ON ไม่ idle
+  if (A_raw < IDLE_RAW_THRESH && B_raw < IDLE_RAW_THRESH) {
+    if (!idleSinceMs) idleSinceMs = millis();
+    if (millis()-idleSinceMs > IDLE_HOLD_MS) {
+      baseA = constrain(0.9f*baseA+0.1f*A_raw,0.0f,0.8f);
+      baseB = constrain(0.9f*baseB+0.1f*B_raw,0.0f,0.8f);
+      Serial.printf("[IdleZero] baseA=%.3f baseB=%.3f (Araw=%.3f Brow=%.3f)\n",
+                    baseA, baseB, A_raw, B_raw);
+      idleSinceMs = millis();
+    }
+  } else idleSinceMs = 0;
+}
+
+/*** Outputs & publish shaping ***/
+float iA_o=0.0f, iB_o=0.0f, iAll_o=0.0f;
+static inline float floorToZero(float x,float eps=2e-3f){ return (fabsf(x)<eps)?0.0f:x; }
+static inline float round2(float x){ return roundf(x*100.0f)/100.0f; }
+
+/*** Auto Soft-Zero timers ***/
+static uint32_t idleZeroTs=0, lastZeroTs=0;
+
+void setup(){
+  Serial.begin(115200);
+  delay(300);
+
+  pinMode(RELAY_A_PIN, OUTPUT);
+  pinMode(RELAY_B_PIN, OUTPUT);
+  bool offLevel = RELAY_ACTIVE_LOW ? HIGH : LOW;
+  digitalWrite(RELAY_A_PIN, offLevel);
+  digitalWrite(RELAY_B_PIN, offLevel);
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+
+  initProperties();
+  ArduinoCloud.begin(ArduinoIoTPreferredConnection);
+  setDebugMessageLevel(2);
+  ArduinoCloud.printDebugInfo();
+
+  Serial.println("[INFO] Boot with COMP=OFF, MODE=SUM, AZ=ON");
+  delay(800);
+  bootZeroIfIdle();
+}
+
+void loop(){
+  ArduinoCloud.update();
+
+  // raw
+  float A_raw = readIrmsHPF(ADC_I_A, offA, V_PER_A_A) * calA;
+  float B_raw = readIrmsHPF(ADC_I_B, offB, V_PER_A_B) * calB;
+  float CT_raw= readIrmsHPF(ADC_I_ALL, offAll, V_PER_A_ALL);
+
+  // idle auto-zero (รีเลย์ต้องปิดทั้งคู่)
+  autoZeroIfIdle(A_raw, B_raw);
+
+  // ---- Auto Soft-Zero: ปิดทั้งคู่ + idle ต่อเนื่อง -> doZero() อัตโนมัติ ----
+  if(!relayA && !relayB){
+    if(A_raw < IDLE_RAW_THRESH && B_raw < IDLE_RAW_THRESH){
+      if(!idleZeroTs) idleZeroTs = millis();
+      if(millis()-idleZeroTs > 4000 && millis()-lastZeroTs > 30000){
+        doZero();
+        lastZeroTs = millis();   // กันไม่ให้ ZERO ถี่เกิน
+      }
+    } else idleZeroTs = 0;
+  } else idleZeroTs = 0;
+  // ---------------------------------------------------------------------------
+
+  // baseline guard
+  if (baseA < 0.0f) baseA = 0.0f;
+  if (baseB < 0.0f) baseB = 0.0f;
+  if (baseA > 0.5f) baseA = 0.0f;
+  if (baseB > 0.5f) baseB = 0.0f;
+
+  // remove baseline
+  float iA = A_raw - baseA; if (iA < 0.0f) iA = 0.0f;
+  float iB = B_raw - baseB; if (iB < 0.0f) iB = 0.0f;
+
+  // deadzone
+  iA = deadzone(iA, DZ_A);
+  iB = deadzone(iB, DZ_B);
+  float iAll_ct = deadzone(CT_raw, DZ_CT);
+
+  // force zero for tiny values
+  if (iA < NO_LOAD_THRESHOLD) iA = 0.0f;
+  if (iB < NO_LOAD_THRESHOLD) iB = 0.0f;
+
+  // gating: รีเลย์ปิด = ศูนย์
+  if (RELAY_GATING){ if (!relayA) iA=0.0f; if (!relayB) iB=0.0f; }
+
+  // B compensation (optional)
+  float iB_comp = compEnabled ? (iB - leakK_BA * iA) : iB;
+  if (iB_comp < DZ_B_COMP) iB_comp = 0.0f;
+
+  // All
+  float iAll_calc = (allMode==MODE_SUM) ? (iA + iB_comp) : iAll_ct;
+
+  // auto learn K
+  leakAutoCal(iA, iB_comp);
+
+  // smooth
+  iA_o   = ema(iA_o,   iA,        EMA_ALPHA_OUT);
+  iB_o   = ema(iB_o,   iB_comp,   EMA_ALPHA_OUT);
+  iAll_o = ema(iAll_o, iAll_calc, EMA_ALPHA_OUT);
+
+  // publish (ฟลัชเป็น 0.00)
+  float A_pub   = round2(floorToZero(iA_o));
+  float B_pub   = round2(floorToZero(iB_o));
+  float All_pub = round2(floorToZero(iAll_o));
+  currentA   = A_pub;
+  currentB   = B_pub;
+  currentAll = All_pub;
+
+  Serial.printf("Araw=%.3f baseA=%.3f -> A=%.3f | Brow=%.3f baseB=%.3f -> B'=%.3f (K=%.2f, COMP=%d) | All=%.3f | PUB=%.2f,%.2f,%.2f\n",
+                A_raw, baseA, iA, B_raw, baseB, iB_comp, leakK_BA, compEnabled, iAll_calc,
+                A_pub, B_pub, All_pub);
+
+  delay(300);
+}
+
+/*** Cloud commands ***/
+void onMsgCommandChange(){
+  if (!msgCommand.length()) return;
+  String s = msgCommand; s.trim(); s.toUpperCase();
+  Serial.print("[Cloud] cmd: "); Serial.println(s);
+
+  // Fine scale
+  if (s.startsWith("CAL A =")){
+    float target = s.substring(8).toFloat();
+    float meas   = readIrmsHPF(ADC_I_A, offA, V_PER_A_A);
+    if (meas > 0.0005f){ calA = target / meas; Serial.printf("[Cal] calA=%.4f\n", calA); }
+  }
+  if (s.startsWith("CAL B =")){
+    float target = s.substring(8).toFloat();
+    float meas   = readIrmsHPF(ADC_I_B, offB, V_PER_A_B);
+    if (meas > 0.0005f){ calB = target / meas; Serial.printf("[Cal] calB=%.4f\n", calB); }
+  }
+
+  // ZERO manual
+  if (s == "ZERO"){ doZero(); }
+  if (s == "SOFT ZERO"){
+    double sA=0, sB=0; int n=0; uint32_t t0=millis();
+    while (millis()-t0 < 600){
+      sA += readIrmsHPF(ADC_I_A, offA, V_PER_A_A) * calA;
+      sB += readIrmsHPF(ADC_I_B, offB, V_PER_A_B) * calB;
+      n++; delay(40);
+    }
+    baseA = constrain((float)(sA/(n?n:1)), 0.0f, 0.8f);
+    baseB = constrain((float)(sB/(n?n:1)), 0.0f, 0.8f);
+    Serial.printf("[SoftZero] baseA=%.3f baseB=%.3f\n", baseA, baseB);
+  }
+  if (s == "RESET ZERO"){ baseA=0.0f; baseB=0.0f; Serial.println("[Zero] reset baselines"); }
+
+  // Compensation manual
+  if (s == "COMP ON"){  compEnabled=true;  Serial.println("[Comp] ON"); }
+  if (s == "COMP OFF"){ compEnabled=false; Serial.println("[Comp] OFF"); }
+  if (s.startsWith("SET K")){
+    float k = s.substring(5).toFloat();
+    leakK_BA = constrain(k, 0.0f, 3.0f);
+    Serial.printf("[Comp] K=%.3f\n", leakK_BA);
+  }
+  if (s == "CAL LEAK"){
+    double sumA=0, sumB=0; int n=0; uint32_t t0=millis();
+    while (millis()-t0 < 2000){
+      sumA += readIrmsHPF(ADC_I_A, offA, V_PER_A_A)*calA - baseA;
+      sumB += readIrmsHPF(ADC_I_B, offB, V_PER_A_B)*calB - baseB;
+      n++; delay(50);
+    }
+    if (n>0){
+      float Aavg = (float)(sumA / n);
+      float Bavg = (float)(sumB / n);
+      if (Aavg < 0.0f) Aavg = 0.0f;
+      if (Bavg < 0.0f) Bavg = 0.0f;
+      if (Aavg > 0.02f){
+        leakK_BA = constrain(Bavg / Aavg, 0.0f, 3.0f);
+      }
+      Serial.printf("[CalLeak] K=%.3f (Aavg=%.3f, Bavg=%.3f)\n", leakK_BA, Aavg, Bavg);
+    }
+  }
+
+  // All mode
+  if (s == "MODE SUM"){ allMode=MODE_SUM; Serial.println("[Mode] All = A + B'"); }
+  if (s == "MODE CT") { allMode=MODE_CT;  Serial.println("[Mode] All = CT(A6)"); }
+
+  // Auto-Zero switch
+  if (s == "AZ OFF") { autoZeroEnabled = false; Serial.println("[AutoZero] OFF"); }
+  if (s == "AZ ON")  { autoZeroEnabled = true;  Serial.println("[AutoZero] ON");  }
+
+  // Relays via text
+  if (s.indexOf("A ON")  >=0){ relayA=true;  onRelayAChange(); }
+  if (s.indexOf("A OFF") >=0){ relayA=false; onRelayAChange(); }
+  if (s.indexOf("B ON")  >=0){ relayB=true;  onRelayBChange(); }
+  if (s.indexOf("B OFF") >=0){ relayB=false; onRelayBChange(); }
+}
+
+/*** Cloud variable callbacks ***/
+void onRelayAChange(){
+  bool level = RELAY_ACTIVE_LOW ? !relayA : relayA;
+  digitalWrite(RELAY_A_PIN, level ? HIGH : LOW);
+  if (!relayA && RELAY_GATING) { currentA = iA_o = 0.0f; }
+  Serial.printf("[Cloud] Relay A -> %s\n", relayA ? "ON" : "OFF");
+}
+
+void onRelayBChange(){
+  bool level = RELAY_ACTIVE_LOW ? !relayB : relayB;
+  digitalWrite(RELAY_B_PIN, level ? HIGH : LOW);
+  if (!relayB && RELAY_GATING) { currentB = iB_o = 0.0f; }
+  Serial.printf("[Cloud] Relay B -> %s\n", relayB ? "ON" : "OFF");
+}
+
+void onResetEnergyChange(){
+  if (resetEnergy){
+    resetEnergy=false;
+    // ถ้ามีตัวสะสมพลังงานเพิ่มในภายหลัง ให้ล้างค่าในนี้
+    Serial.println("[Cloud] Energy reset.");
+  }
+}
