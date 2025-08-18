@@ -1,3 +1,5 @@
+//ในส่วนนี้ยังไม่ได้ทำเกี่ยวกับการแสดงพลังงานที่ใช้ในแต่ละสัปดาห์
+
 #include "thingProperties.h"
 #include <Arduino.h>
 #include <math.h>
