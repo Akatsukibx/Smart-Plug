@@ -1,0 +1,868 @@
+#include "thingProperties.h"
+#include <Arduino.h>
+#include <math.h>
+#include <DHT.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <Preferences.h>
+#include <time.h>
+
+/* ==== ส่ง Google Sheet (ใช้ GET) ==== */
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+const char* SCRIPT_URL   = "https://script.google.com/macros/s/AKfycbwwh1iHw0ioHvhnfV7dnVMm1KOaOvqNyYYx_rDWPNM4ollCS3qthoeMOIwrl0tMi9ju-w/exec";
+const char* SHEET_SECRET = "Smart_Plug";
+const unsigned long POST_INTERVAL_MS = 60000UL;
+unsigned long lastPostMs = 0;
+volatile bool needImmediatePost = false;
+static bool tripA_flag = false;
+static bool tripB_flag = false;
+
+/* ==== Reset Time Config ==== */
+// เวลารวมสรุปพลังงาน (รายวัน/รายสัปดาห์) ตามเวลาไทย
+const int RESET_HOUR = 23;   // ชั่วโมง (0..23)  ← เปลี่ยนเวลารีเซ็ตตรงนี้
+const int RESET_MIN  = 59;  // นาที   (0..59)  ← เปลี่ยนเวลารีเซ็ตตรงนี้
+
+/* ===== Pin map ===== */
+#ifndef D2
+#define D2 2
+#endif
+#ifndef D5
+#define D5 5
+#endif
+#define RELAY_A_PIN D2
+#define RELAY_B_PIN D5
+#define RELAY_ON  HIGH
+#define RELAY_OFF LOW
+
+#define ADC_V_A    A0   // ZMPT A
+#define ADC_V_B    A1   // ZMPT B
+#define ADC_I_A    A3   // Current A (Counts-RMS)
+#define ADC_I_B    A2   // Current B (Counts-RMS)
+#define I2C_SDA    A4   // DS3231 SDA
+#define I2C_SCL    A5   // DS3231 SCL
+#define ADC_I_ALL  A6   // SCT013 All (ไม่ใช้โหมด SUM)
+#define ADC_V_ALL  A7   // ZMPT All
+
+// DHT11
+#define DHTPIN   D8
+#define DHTTYPE  DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+/* ===== ADC helpers (แรงดัน) ===== */
+const float ADC_REF = 3.3f;
+const int   ADC_MAX = 4095;
+inline float adcToVolt(int raw){ return (ADC_REF * raw) / ADC_MAX; }
+inline int readADConce(int pin){ analogRead(pin); return analogRead(pin); }
+float measureOffsetV(uint8_t pin,int n=400){ double s=0; for(int i=0;i<n;i++) s+=adcToVolt(readADConce(pin)); return s/n; }
+auto round1=[](float x){ return roundf(x*10.0f)/10.0f; };
+auto round2=[](float x){ return roundf(x*100.0f)/100.0f; };
+auto zfloor=[](float x,float th){ return (fabsf(x)<th)?0.0f:x; };
+
+/* ===== คาลิเบรตแรงดัน (คงของเดิม) ===== */
+float vA_offsetV=2.50f, vB_offsetV=2.50f, vALL_offsetV=2.50f;
+float vA_scaleV_perV=221.90f, vB_scaleV_perV=220.94f, vALL_scaleV_perV=223.36f;
+
+/* ===== Counts-RMS สำหรับ "กระแส" ===== */
+#ifndef ADC_BITS
+#define ADC_BITS 12
+#endif
+#define ADC_FULL_SCALE ((float)((1<<ADC_BITS)-1))   // 4095
+
+// ตัวคูณสเกล: I(A) = norm(0..1) * I_SCALE_*
+float I_SCALE_A = 100.0f;   // คาลิเบรตด้วย "CAL A <แอมป์อ้างอิง>"
+float I_SCALE_B = 100.0f;
+
+// ออฟเซ็ตสำหรับ "ค่าที่ใช้ทุกอย่าง" (แสดงผล/พลังงาน/OC)
+float DISP_BIAS_A = 0.04f;
+float DISP_BIAS_B = 0.04f;
+
+/* === ฐาน (baseline) ของกระแสแบบ RMS เพื่อลดค่าเพี้ยนตอนว่าง === */
+float iA_base_norm = 0.0f;     // หน่วยเป็นสัดส่วน ADC (0..1)
+float iB_base_norm = 0.0f;
+const float BASE_MARGIN = 0.00020f;     // บัฟเฟอร์รอบฐาน
+const float BASE_ALPHA  = 0.30f;        // เรตเรียนรู้ฐาน (EMA) ขณะสงบ
+const unsigned long BASE_HOLD_MS = 800; // ต้องสงบต่อเนื่องก่อนเรียนรู้
+
+// สะสม RMS ของกระแสแบบนับค่า ADC
+struct RMSCounts {
+  double sum=0.0, sum2=0.0; uint32_t n=0;
+  inline void push(int x){ sum+=x; sum2+=(double)x*(double)x; n++; }
+  inline float std_norm(){ if(!n) return 0.0f; double m=sum/n; double v=sum2/n - m*m; if(v<0) v=0; return (float)(sqrt(v)/ADC_FULL_SCALE); }
+  inline void reset(){ sum=0; sum2=0; n=0; }
+};
+
+// สำหรับ “instant current” (จับกระแสเกินไว)
+struct CenterEMA { double c=2048.0; bool init=false;
+  inline void update(int x){ if(!init){ c=x; init=true; } else c = 0.02*x + 0.98*c; }
+  inline float abs_dev_norm(int x){ update(x); double d=fabs((double)x - c); return (float)(d/ADC_FULL_SCALE); }
+};
+
+RMSCounts iA_cnt, iB_cnt;
+CenterEMA  iA_ctr, iB_ctr;
+
+// RMS ของแรงดัน
+struct RMS{ double sum=0,sum2=0; uint32_t n=0;
+  inline void push(float x){ sum+=x; sum2+= (double)x*x; n++; }
+  inline float rms() const { if(!n) return 0; double m=sum/n; double v=sum2/n - m*m; if(v<0) v=0; return sqrt(v); }
+  inline void reset(){ sum=0; sum2=0; n=0; }
+};
+RMS vA_r, vB_r, vALL_r;
+
+/* ===== EMA ===== */
+struct EMA{ float y=0; bool init=false; float alpha=0.2f;
+  void setTauSeconds(float tau){ if(tau<=0) alpha=1; else alpha = 1.0f - expf(-1.0f/tau); }
+  float filt(float x){ if(!init){ y=x; init=true; } else y = alpha*x + (1-alpha)*y; return y; }
+  void reset(){ init=false; }
+};
+EMA ema_iA,ema_iB,ema_iALL, ema_pA,ema_pB, ema_temp,ema_hum;
+void setupSmoothers(){ float TAU=3.0f;
+  ema_iA.setTauSeconds(TAU); ema_iB.setTauSeconds(TAU); ema_iALL.setTauSeconds(TAU);
+  ema_pA.setTauSeconds(TAU); ema_pB.setTauSeconds(TAU);
+  ema_temp.setTauSeconds(5.0f); ema_hum.setTauSeconds(5.0f);
+}
+
+/* ===== Overcurrent ===== */
+const float LIMIT_A = 10.0f, LIMIT_B = 10.0f;  // ตั้งกระแสตัด 10A
+const float LIMIT_MARGIN = 0.5f;               // เผื่อ margin
+const unsigned long TRIP_HOLD_MS = 200;
+bool latchedA=false, latchedB=false;
+unsigned long aOverStart=0, bOverStart=0;
+
+/* ===== ระบบ/พลังงาน & timers ===== */
+double   sumW_A=0, sumW_B=0; uint32_t nW_A=0,  nW_B=0;
+unsigned long last1s=0;
+uint32_t capSinceA=0, capSinceB=0;
+Preferences prefs;
+
+volatile bool g_echoing=false;
+inline void pushReply(const String& s){ msgReply=s; Serial.println("[Reply] "+s);
+  g_echoing=true; msgCommand=s; ArduinoCloud.update(); g_echoing=false; }
+
+void setAlertMessage(const String& s){
+  static String last;
+  if (s != last){
+    msgReply = s; ocAlert  = s;
+    Serial.println("[Alert] " + s);
+    last = s;
+    needImmediatePost = true;
+  }
+}
+String fmt2(float x){ char b[16]; snprintf(b, sizeof(b), "%.2f", x); return String(b); }
+
+/* ===== RTC / Time ===== */
+RTC_DS3231 rtc; bool rtcOK=false, ntpOK=false;
+const long TZ_OFFSET_SEC = 7L*3600L; // Asia/Bangkok
+static inline uint32_t compileUTC(){ DateTime c(F(__DATE__),F(__TIME__)); return c.unixtime(); }
+inline uint32_t nowUtc(){ time_t t=time(nullptr); if(ntpOK && t>1700000000) return (uint32_t)t;
+  if(rtcOK) return rtc.now().unixtime(); static uint32_t boot=0; if(!boot) boot=compileUTC(); return boot + millis()/1000UL; }
+
+/* ===== time utils (TH) ===== */
+String humanDeltaTH_fromSeconds(uint32_t d){ if((int32_t)d<=0) return "เดี๋ยวนี้";
+  unsigned long s=d,h=s/3600; s%=3600; unsigned long m=s/60; s%=60; if(s>0)m++;
+  if(m>=60){ h+=m/60; m%=60; } String out="อีก "; if(h){ out+=String(h)+" ชั่วโมง"; if(m) out+=" "+String(m)+" นาที"; }
+  else if(m) out+=String(m)+" นาที"; else out+="น้อยกว่า 1 นาที"; return out; }
+String formatWhenRelativeUTC(uint32_t t){ uint32_t n=nowUtc(); return humanDeltaTH_fromSeconds(t>n?t-n:0); }
+
+/* ===== Timers (UTC) + โหมดโชว์เฉพาะ All ===== */
+uint32_t A_onAt_s=0,A_offAt_s=0,B_onAt_s=0,B_offAt_s=0;
+bool showNextA=false, showNextB=false, showNextAll=false, showOnlyAll=false;
+void saveTimers(){ prefs.begin("timers",false);
+  prefs.putUInt("A_on",A_onAt_s); prefs.putUInt("A_off",A_offAt_s);
+  prefs.putUInt("B_on",B_onAt_s); prefs.putUInt("B_off",B_offAt_s); prefs.end(); }
+void loadTimers(){ prefs.begin("timers",true);
+  A_onAt_s=prefs.getUInt("A_on",0); A_offAt_s=prefs.getUInt("A_off",0);
+  B_onAt_s=prefs.getUInt("B_on",0); B_offAt_s=prefs.getUInt("B_off",0); prefs.end(); }
+inline bool due(uint32_t when_s,uint32_t now_s){ return (when_s!=0)&&((int32_t)(now_s-when_s)>=0); }
+int clampMinutes(int m){ if(m<0)return 0; if(m>1440)return 1440; return m; }
+
+/* ===== Parser / Command ===== */
+String normalizeSpaces(String s){
+  s.trim();
+  const char* specials[] = { "\xC2\xA0", "\xE2\x80\x8B", "\xE2\x80\x8C", "\xE2\x80\x8D" };
+  for (const char* pat : specials) while (s.indexOf(pat) >= 0) s.replace(pat, " ");
+  while (s.indexOf("  ") >= 0) s.replace("  ", " ");
+  return s;
+}
+String toUpperAscii(String s){ for(size_t i=0;i<s.length();++i){ char c=s[i]; if(c>='a'&&c<='z') s[i]=c-32; } return s; }
+void split3Tokens(const String& s,String& t1,String& t2,String& t3){
+  int p1=s.indexOf(' ');
+  if(p1<0){ t1=s; t2=""; t3=""; return; }
+  t1=s.substring(0,p1);
+  int p2=s.indexOf(' ', p1+1);
+  if(p2<0){ t2=s.substring(p1+1); t3=""; return; }
+  t2=s.substring(p1+1,p2);
+  t3=s.substring(p2+1);
+}
+bool isAny(const String& token,const char* a,const char* b,const char* c){
+  String T=toUpperAscii(token);
+  if(a){String A=a; if(toUpperAscii(A)==T||token==A) return true;}
+  if(b){String B=b; if(toUpperAscii(B)==T||token==B) return true;}
+  if(c){String C=c; if(toUpperAscii(C)==T||token==C) return true;}
+  return false;
+}
+String join(const char* a[],int n){ String s; for(int i=0;i<n;i++){ if(i) s+=" | "; s+=a[i]; } return s; }
+void showSuggestions(char which){
+  if(which=='?'){ const char* root[]={"A ...","B ...","All ...","help"};
+    pushReply("Try: "+join(root,4)+"\nตัวอย่าง: A เปิด 2 ชั่วโมง 30 นาที, B ปิด 30 นาที, All on at 21:30"); return; }
+  const char* th[]={"เปิด [เวลา]","ปิด [เวลา]","ยกเลิก"}; const char* en[]={"on [time]","off [time]","cancel"};
+  String head=(which=='A')?"A":(which=='B')?"B":"All";
+  pushReply(head+" → "+join(th,3)+"\nEN: "+head+" "+join(en,3)+"\n[เวลา]= 30 นาที | 1 ชั่วโมง | 2 ชั่วโมง 30 นาที | at 21:30");
+}
+int extractFirstInt(const String& s){ String d=""; for(size_t i=0;i<s.length();++i){ char c=s[i]; if(c>='0'&&c<='9') d+=c; else if(d.length()) break; } return d.length()? d.toInt():-1; }
+bool hasHourUnit(String s){
+  String u=toUpperAscii(s);
+  if(u.indexOf("HR")>=0||u.indexOf("H ")>=0||u.endsWith("H")) return true;
+  if(s.indexOf("ชั่วโมง")>=0||s.indexOf("ชม.")>=0) return true;
+  return false;
+}
+bool hasMinuteUnit(String s){
+  String u=toUpperAscii(s);
+  if(u.indexOf("MIN")>=0 || u=="M" || u.endsWith(" M")) return true;
+  if(s.indexOf("นาที")>=0) return true;
+  return false;
+}
+int parseDurationToMinutes(String s){
+  s=normalizeSpaces(s); s.replace("อีก",""); s.trim(); int total=0,pos=0;
+  while(pos<(int)s.length()){
+    while(pos<(int)s.length()&&s[pos]==' ') pos++;
+    if(pos>=(int)s.length()) break;
+    int ns=s.indexOf(' ',pos);
+    String token=(ns<0)? s.substring(pos): s.substring(pos,ns);
+    pos=(ns<0)? s.length():ns+1;
+    int v=extractFirstInt(token); if(v<0) continue; bool handled=false;
+    if(hasHourUnit(token)){ total+=v*60; handled=true; }
+    else if(hasMinuteUnit(token)){ total+=v; handled=true; }
+    else{
+      int ns2=s.indexOf(' ',pos); String next=(ns2<0)? s.substring(pos): s.substring(pos,ns2);
+      if(next.length()){
+        if(hasHourUnit(next)){ total+=v*60; handled=true; pos=(ns2<0? s.length(): ns2+1); }
+        else if(hasMinuteUnit(next)){ total+=v; handled=true; pos=(ns2<0? s.length(): ns2+1); }
+      }
+    }
+    if(!handled) total+=v;
+  }
+  return clampMinutes(total);
+}
+bool hasAtKeyword(String s){
+  s=normalizeSpaces(s); String u=toUpperAscii(s);
+  if(u.indexOf(" AT ")>=0 || u.startsWith("AT ") || u.endsWith(" AT")) return true;
+  if (s.indexOf("เวลา")>=0) return true; return false;
+}
+bool findHHMM(const String& s,int& hh,int& mm){
+  int c=s.indexOf(':'); if(c<0) return false; int l=c-1; while(l>=0 && isDigit(s[l])) l--; l++;
+  int r=c+1; while(r<(int)s.length() && isDigit(s[r])) r++; String H=s.substring(l,c), M=s.substring(c+1,r);
+  if(H.length()==0||M.length()<1) return false; int h=H.toInt(), m=M.toInt(); if(h<0||h>23||m<0||m>59) return false; hh=h; mm=m; return true;
+}
+uint32_t parseLocalHHMM_toUTC(const String& tail){
+  int hh=-1,mm=-1; if(!findHHMM(tail,hh,mm)) return 0; uint32_t now=nowUtc();
+  DateTime nowL(now+TZ_OFFSET_SEC); DateTime tgtL(nowL.year(),nowL.month(),nowL.day(),hh,mm,0);
+  uint32_t tgt=tgtL.unixtime()-TZ_OFFSET_SEC; if((int32_t)(tgt-now)<=0) tgt=(tgtL+TimeSpan(1,0,0,0)).unixtime()-TZ_OFFSET_SEC; return tgt;
+}
+
+/* ===== Actions / status ===== */
+String whoStr(char w){ return String((w=='X')?"ALL":(w=='A'?"A":"B")); }
+String actFutureTH(bool on){ return String(on? "จะเปิด":"จะปิด"); }
+void scheduleAction(char which,bool turnOn,int minutes){
+  minutes=clampMinutes(minutes); uint32_t when=nowUtc() + (uint32_t)minutes*60UL;
+  if(which=='A'||which=='X'){ if(turnOn) A_onAt_s=(minutes==0)? nowUtc():when; else A_offAt_s=(minutes==0)? nowUtc():when; }
+  if(which=='B'||which=='X'){ if(turnOn) B_onAt_s=(minutes==0)? nowUtc():when; else B_offAt_s=(minutes==0)? nowUtc():when; }
+  if(which=='A') showNextA=(minutes>0);
+  else if(which=='B') showNextB=(minutes>0);
+  else if(which=='X'){ showNextAll=(minutes>0); showNextA=showNextB=false; showOnlyAll=true; }
+  saveTimers();
+  pushReply(whoStr(which)+" "+actFutureTH(turnOn)+" "+(minutes? formatWhenRelativeUTC(when):"เดี๋ยวนี้"));
+}
+void scheduleActionAt(char which,bool turnOn,uint32_t when){
+  if(which=='A'||which=='X'){ if(turnOn) A_onAt_s=when; else A_offAt_s=when; }
+  if(which=='B'||which=='X'){ if(turnOn) B_onAt_s=when; else B_offAt_s=when; }
+  if(which=='A') showNextA=(when>nowUtc());
+  else if(which=='B') showNextB=(when>nowUtc());
+  else if(which=='X'){ showNextAll=(when>nowUtc()); showNextA=showNextB=false; showOnlyAll=true; }
+  saveTimers(); pushReply(whoStr(which)+" "+actFutureTH(turnOn)+" "+formatWhenRelativeUTC(when));
+}
+void cancelTimers(char which){
+  if(which=='A'||which=='X'){ A_onAt_s=0; A_offAt_s=0; showNextA=false; }
+  if(which=='B'||which=='X'){ B_onAt_s=0; B_offAt_s=0; showNextB=false; }
+  if(which=='X'){ showNextAll=false; showOnlyAll=false; }
+  saveTimers(); pushReply(whoStr(which)+" ยกเลิกตัวจับเวลาแล้ว");
+}
+String relStr(uint32_t when){ if(!when) return ""; return formatWhenRelativeUTC(when); }
+String nextABText(char w){ uint32_t onT=(w=='A')?A_onAt_s:B_onAt_s, offT=(w=='A')?A_offAt_s:B_offAt_s;
+  if(!onT && !offT) return ""; if(onT && (!offT || (int32_t)(onT-offT)<0)) return String("(จะเปิด ")+relStr(onT)+")";
+  return String("(จะปิด ")+relStr(offT)+")"; }
+String nextALLText(){ uint32_t tmin=0; bool isOn=false; uint32_t ts[4]={A_onAt_s,A_offAt_s,B_onAt_s,B_offAt_s}; bool ton[4]={true,false,true,false};
+  for(int i=0;i<4;i++){ if(!ts[i]) continue; if(!tmin || (int32_t)(ts[i]-tmin)<0){ tmin=ts[i]; isOn=ton[i]; } }
+  if(!tmin) return ""; return String(isOn? "จะเปิด ":"จะปิด ")+relStr(tmin);
+}
+void updateStatusNow(){
+  if(showOnlyAll){
+    String t=nextALLText();
+    String line = t.length()? ("All: "+t) : (String("All: ")+((relayA||relayB)?"เปิดใช้งาน":"ปิดใช้งาน"));
+    if(statusNow!=line){ statusNow=line; Serial.println(String("[Status] ")+statusNow); }
+    return;
+  }
+  String aState=relayA?"เปิดใช้งาน":"ปิดใช้งาน";
+  String bState=relayB?"เปิดใช้งาน":"ปิดใช้งาน";
+  String msg="Plug A: "+aState; if(showNextA){ String t=nextABText('A'); if(t.length()) msg+=" "+t; }
+  msg+="\nPlug B: "+bState; if(showNextB){ String t=nextABText('B'); if(t.length()) msg+=" "+t; }
+  if(showNextAll){ String t=nextALLText(); if(t.length()) msg+="\nAll: "+t; }
+  static String last=""; if(msg!=last){ statusNow=msg; last=msg; Serial.println(String("[Status] ")+msg); }
+}
+
+/* ==== baseline helpers ==== */
+float measureCurrentBaseNorm(uint8_t pin, int N=1200){
+  double s=0, s2=0;
+  for(int i=0;i<N;i++){ int x=analogRead(pin); s+=x; s2+=(double)x*(double)x; delayMicroseconds(500); }
+  double m=s/N; double v=s2/N - m*m; if(v<0) v=0; return (float)(sqrt(v)/ADC_FULL_SCALE);
+}
+
+/* ===== Energy summaries (one-shot reset at configured time) ===== */
+double g_dailyWh=0.0, g_weeklyWh=0.0;        // running
+double g_dailyWhPrev=0.0, g_weeklyWhPrev=0.0; // last closed
+uint16_t lastResetY=0, lastResetM=0, lastResetD=0;
+bool didResetToday=false;
+
+void updateEnergySummaries(double powerTotalW){
+  const double dWhInc = powerTotalW * (1.0/3600.0);
+  g_dailyWh  += dWhInc;
+  g_weeklyWh += dWhInc;
+
+  const uint32_t now = nowUtc();
+  DateTime loc(now + TZ_OFFSET_SEC);
+
+  // อนุญาตรีเซ็ตใหม่ถ้าเปลี่ยนวันแล้ว
+  if (loc.year()!=lastResetY || loc.month()!=lastResetM || loc.day()!=lastResetD){
+    didResetToday = false;
+  }
+
+  // ตัดยอดเมื่อถึงเวลาที่ตั้งไว้ (1 ครั้งต่อวัน)
+  if (!didResetToday && loc.hour()==RESET_HOUR && loc.minute()==RESET_MIN){
+    // ปิดยอดรายวัน
+    g_dailyWhPrev = g_dailyWh;
+    g_dailyWh = 0.0;
+
+    // ถ้า "เมื่อวาน" คืออังคาร → ปิดยอดรายสัปดาห์
+    DateTime yesterday = loc - TimeSpan(1,0,0,0);
+    if (yesterday.dayOfTheWeek() == 2){ // 0=Sun,1=Mon,2=Tue
+      g_weeklyWhPrev = g_weeklyWh;
+      g_weeklyWh = 0.0;
+    }
+
+    didResetToday = true;
+    lastResetY = loc.year(); lastResetM = loc.month(); lastResetD = loc.day();
+    needImmediatePost = true;
+    Serial.println("[ENERGY] closed daily (and weekly if Tue).");
+  }
+
+  // อัปเดตไปที่ Arduino Cloud
+  dailyWh      = roundf(g_dailyWh      *100.0f)/100.0f;
+  weeklyWh     = roundf(g_weeklyWh     *100.0f)/100.0f;
+  dailyWhPrev  = roundf(g_dailyWhPrev  *100.0f)/100.0f;
+  weeklyWhPrev = roundf(g_weeklyWhPrev *100.0f)/100.0f;
+}
+
+/* ==== setup ==== */
+void setup(){
+  Serial.begin(115200); delay(1500);
+  Serial.println("[BOOT] Smart Plug");
+
+  initProperties();
+  ArduinoCloud.begin(ArduinoIoTPreferredConnection);
+  setDebugMessageLevel(2);
+  ArduinoCloud.printDebugInfo();
+
+  // NTP UTC
+  configTzTime("UTC0","pool.ntp.org","time.google.com","time.nist.gov");
+  for (int i=0;i<30;i++){ time_t t=time(nullptr); if (t>1700000000){ ntpOK=true; break; } delay(100); }
+
+  pinMode(RELAY_A_PIN, OUTPUT); pinMode(RELAY_B_PIN, OUTPUT);
+  digitalWrite(RELAY_A_PIN, relayA ? RELAY_ON : RELAY_OFF);
+  digitalWrite(RELAY_B_PIN, relayB ? RELAY_ON : RELAY_OFF);
+
+  /* ★★ ADC config ★★ */
+  analogReadResolution(12);
+  analogSetPinAttenuation(ADC_V_A,  ADC_11db);
+  analogSetPinAttenuation(ADC_V_B,  ADC_11db);
+  analogSetPinAttenuation(ADC_V_ALL,ADC_11db);
+  analogSetPinAttenuation(ADC_I_A,  ADC_11db);
+  analogSetPinAttenuation(ADC_I_B,  ADC_11db);
+
+  dht.begin();
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(100000);
+
+  if (rtc.begin()){
+    rtcOK = true;
+    if (ntpOK){ rtc.adjust(DateTime((uint32_t)time(nullptr))); Serial.println("[RTC] Sync from NTP."); }
+    else if (rtc.lostPower()){ rtc.adjust(DateTime(compileUTC())); Serial.println("[RTC] Lost power - set UTC from compile time."); }
+  }else{
+    rtcOK = false; Serial.println("[RTC] DS3231 not found; using uptime/NTP.");
+  }
+
+  // วัด offset แรงดันตอนบูต (ช่อง ZMPT)
+  vA_offsetV  = measureOffsetV(ADC_V_A);
+  vB_offsetV  = measureOffsetV(ADC_V_B);
+  vALL_offsetV= measureOffsetV(ADC_V_ALL);
+
+  // จับ baseline กระแสตอนบูต (ควรบูตตอนถอดโหลด)
+  iA_base_norm = measureCurrentBaseNorm(ADC_I_A);
+  iB_base_norm = measureCurrentBaseNorm(ADC_I_B);
+  Serial.printf("[BASE] iA_base_norm=%.6f  iB_base_norm=%.6f\n", iA_base_norm, iB_base_norm);
+
+  Serial.printf("[ADC off] vA=%.3fV vB=%.3fV vALL=%.3fV\n",
+    vA_offsetV, vB_offsetV, vALL_offsetV);
+
+  loadTimers();
+  setupSmoothers();
+  statusNow = "พร้อมใช้งาน";
+
+  // ตั้งวันที่รีเซ็ตล่าสุดเท่ากับวันนี้ (กันรีเซ็ตทันทีถ้าบูตพอดีเวลา)
+  DateTime loc(nowUtc() + TZ_OFFSET_SEC);
+  lastResetY = loc.year(); lastResetM = loc.month(); lastResetD = loc.day();
+}
+
+/* ===== กันปลายลอย + หน่วงแสดงผล ===== */
+const float MAINS_VALID_MIN     = 180.0f;
+const float CH_FLOATING_MAX_ON  =  60.0f;
+const float CH_FLOATING_EXIT    =  80.0f;
+const unsigned long SUB_IN_DELAY_MS = 1000;
+
+bool useAllForA=false, useAllForB=false;
+unsigned long useAllA_since=0, useAllB_since=0;
+
+void loop(){
+  ArduinoCloud.update();
+  unsigned long nowMs = millis();
+  uint32_t now_utc = nowUtc();
+
+  // DHT ~2s
+  static unsigned long lastDHT=0;
+  if(nowMs - lastDHT >= 2000){
+    float h=dht.readHumidity(), t=dht.readTemperature();
+    if(!isnan(h)&&!isnan(t)){ humidity=round1(ema_hum.filt(h)); tempC=round1(ema_temp.filt(t)); }
+    lastDHT=nowMs;
+  }
+
+  /* ===== อ่าน ADC สะสม RMS ===== */
+  // แรงดัน
+  float vVA   = adcToVolt(readADConce(ADC_V_A))   - vA_offsetV;
+  float vVB   = adcToVolt(readADConce(ADC_V_B))   - vB_offsetV;
+  float vVALL = adcToVolt(readADConce(ADC_V_ALL)) - vALL_offsetV;
+  vA_r.push(vVA); vB_r.push(vVB); vALL_r.push(vVALL);
+
+  // กระแส: Counts-RMS
+  int rIA = readADConce(ADC_I_A);
+  int rIB = readADConce(ADC_I_B);
+  iA_cnt.push(rIA); iB_cnt.push(rIB);
+
+  // instant สำหรับ OC
+  float instIA = iA_ctr.abs_dev_norm(rIA) * I_SCALE_A;
+  float instIB = iB_ctr.abs_dev_norm(rIB) * I_SCALE_B;
+
+  if(nowMs - last1s >= 1000){
+    rtcISO = String("ok:") + (ntpOK? "ntp" : (rtcOK? "rtc-utc":"uptime-utc"));
+
+    // Vrms
+    float VrmsA  = vA_r.rms()*vA_scaleV_perV;
+    float VrmsB  = vB_r.rms()*vB_scaleV_perV;
+    float VrmsALL= vALL_r.rms()*vALL_scaleV_perV;
+
+    // Irms (หัก baseline)
+    float normA_meas = iA_cnt.std_norm();
+    float normB_meas = iB_cnt.std_norm();
+
+    float normA_eff = 0.0f, normB_eff = 0.0f;
+    if (normA_meas > iA_base_norm + BASE_MARGIN){
+      float sq = normA_meas*normA_meas - iA_base_norm*iA_base_norm;
+      if (sq > 0) normA_eff = sqrtf(sq);
+    }
+    if (normB_meas > iB_base_norm + BASE_MARGIN){
+      float sq = normB_meas*normB_meas - iB_base_norm*iB_base_norm;
+      if (sq > 0) normB_eff = sqrtf(sq);
+    }
+
+    float IrmsA = normA_eff * I_SCALE_A;
+    float IrmsB = normB_eff * I_SCALE_B;
+
+    // หักออฟเซ็ตใช้งานจริง
+    float dispA = IrmsA - DISP_BIAS_A; if (dispA < 0) dispA = 0;
+    float dispB = IrmsB - DISP_BIAS_B; if (dispB < 0) dispB = 0;
+
+    currentA   = zfloor(round2( ema_iA.filt(dispA) ), 0.01f);
+    currentB   = zfloor(round2( ema_iB.filt(dispB) ), 0.01f);
+
+    /* ===== auto-learn baseline เมื่อสงบ ===== */
+    bool quietA = (!relayA) || (dispA < 0.03f);
+    bool quietB = (!relayB) || (dispB < 0.03f);
+    if (quietA){
+      if(!capSinceA) capSinceA=nowMs;
+      if (nowMs - capSinceA > BASE_HOLD_MS){
+        iA_base_norm = (1.0f-BASE_ALPHA)*iA_base_norm + BASE_ALPHA*normA_meas;
+      }
+    }else capSinceA=0;
+    if (quietB){
+      if(!capSinceB) capSinceB=nowMs;
+      if (nowMs - capSinceB > BASE_HOLD_MS){
+        iB_base_norm = (1.0f-BASE_ALPHA)*iB_base_norm + BASE_ALPHA*normB_meas;
+      }
+    }else capSinceB=0;
+
+    /* ===== anti-floating: เลือกแรงดันโชว์ ===== */
+    bool Aon = relayA;
+    bool Bon = relayB;
+
+    if (Aon){
+      if (!useAllForA){
+        if (VrmsA < CH_FLOATING_MAX_ON && VrmsALL > MAINS_VALID_MIN){ useAllForA = true; useAllA_since = nowMs; }
+      }else{
+        if (VrmsA > CH_FLOATING_EXIT){ useAllForA = false; useAllA_since = 0; }
+      }
+    }else{ useAllForA=false; useAllA_since=0; }
+
+    if (Bon){
+      if (!useAllForB){
+        if (VrmsB < CH_FLOATING_MAX_ON && VrmsALL > MAINS_VALID_MIN){ useAllForB = true; useAllB_since = nowMs; }
+      }else{
+        if (VrmsB > CH_FLOATING_EXIT){ useAllForB = false; useAllB_since = 0; }
+      }
+    }else{ useAllForB=false; useAllB_since=0; }
+
+    bool onlyAon = (Aon && !Bon);
+    bool onlyBon = (Bon && !Aon);
+    bool allowUseAllA = useAllForA && onlyAon && (nowMs - useAllA_since >= SUB_IN_DELAY_MS);
+    bool allowUseAllB = useAllForB && onlyBon && (nowMs - useAllB_since >= SUB_IN_DELAY_MS);
+
+    float vA_show = Aon ? (allowUseAllA ? VrmsALL : VrmsA) : 0.0f;
+    float vB_show = Bon ? (allowUseAllB ? VrmsALL : VrmsB) : 0.0f;
+
+    voltageA   = round1(vA_show);
+    voltageB   = round1(vB_show);
+    voltageAll = round1(VrmsALL);
+
+    // กระแสรวมแบบ SUM (A+B ตามรีเลย์ที่เปิดอยู่)
+    float iAll_sum = (Aon ? currentA : 0.0f) + (Bon ? currentB : 0.0f);
+    currentAll = zfloor(round2( ema_iALL.filt(iAll_sum) ), 0.01f);
+
+    // กำลัง Apparent — ใช้ค่า bias แล้ว
+    float pA = Aon ? (vA_show * dispA) : 0.0f;
+    float pB = Bon ? (vB_show * dispB) : 0.0f;
+
+    powerA = round2( ema_pA.filt(pA) );
+    powerB = round2( ema_pB.filt(pB) );
+
+    float powerTotal = 0.0f;
+    if (Aon) powerTotal += powerA;
+    if (Bon) powerTotal += powerB;
+    if (powerTotal < 0) powerTotal = 0;
+
+    // สะสมพลังงานรวม (Wh)
+    energyWh += powerTotal * (1.0f/3600.0f);
+
+    // === สรุปพลังงานรายวัน/สัปดาห์ (ตัดยอดตามเวลา) ===
+    updateEnergySummaries(powerTotal);
+
+    // Debug
+    Serial.printf("[DBG] IA=%.3fA IB=%.3fA ALL=%.3fA vA=%.1f vB=%.1f vALL=%.1f P=%.2fW\n",
+                  currentA, currentB, currentAll, voltageA, voltageB, voltageAll, powerTotal);
+
+    // รีเซ็ตสะสมรอบถัดไป
+    vA_r.reset(); vB_r.reset(); vALL_r.reset();
+    iA_cnt.reset(); iB_cnt.reset();
+    sumW_A=0; sumW_B=0; nW_A=0; nW_B=0; last1s=nowMs;
+
+    if (!Aon && currentA != 0.0f) currentA = 0.0f;
+    if (!Bon && currentB != 0.0f) currentB = 0.0f;
+
+    updateStatusNow();
+  }
+
+  /* ===== Overcurrent ===== */
+  float instIA_adj = max(0.0f, iA_ctr.abs_dev_norm(analogRead(ADC_I_A))*I_SCALE_A - DISP_BIAS_A);
+  float instIB_adj = max(0.0f, iB_ctr.abs_dev_norm(analogRead(ADC_I_B))*I_SCALE_B - DISP_BIAS_B);
+
+  bool overA = (currentA > LIMIT_A + LIMIT_MARGIN) || (instIA_adj > LIMIT_A + LIMIT_MARGIN);
+  bool overB = (currentB > LIMIT_B + LIMIT_MARGIN) || (instIB_adj > LIMIT_B + LIMIT_MARGIN);
+
+  bool trippedA = false, trippedB = false;
+
+  if (relayA && !latchedA){
+    if (overA){
+      if (aOverStart==0) aOverStart=nowMs;
+      if (nowMs - aOverStart >= TRIP_HOLD_MS){
+        relayA=false; onRelayAChange(); latchedA=true; aOverStart=0;
+        trippedA=true;
+      }
+    }else aOverStart=0;
+  }
+  if (relayB && !latchedB){
+    if (overB){
+      if (bOverStart==0) bOverStart=nowMs;
+      if (nowMs - bOverStart >= TRIP_HOLD_MS){
+        relayB=false; onRelayBChange(); latchedB=true; bOverStart=0;
+        trippedB=true;
+      }
+    }else bOverStart=0;
+  }
+
+  if (trippedA || trippedB){
+    if (trippedA && trippedB){
+      float limMax = (LIMIT_A > LIMIT_B) ? LIMIT_A : LIMIT_B;
+      setAlertMessage("plugA and plugB กระแสเกิน(" + fmt2(limMax) + "A) ตัดโหลดแล้ว");
+      tripA_flag = true; tripB_flag = true; needImmediatePost = true;
+    }else if (trippedA){
+      setAlertMessage("plugA กระแสเกิน(" + fmt2(LIMIT_A) + "A) ตัดโหลดแล้ว");
+      tripA_flag = true; needImmediatePost = true;
+    }else{
+      setAlertMessage("plugB กระแสเกิน(" + fmt2(LIMIT_B) + "A) ตัดโหลดแล้ว");
+      tripB_flag = true; needImmediatePost = true;
+    }
+  }else{
+    setAlertMessage("Plug A: ทำงานปกติ Plug B: ทำงานปกติ");
+  }
+
+  /* ===== Timers ===== */
+  if (due(A_onAt_s,now_utc)) { A_onAt_s=0; saveTimers(); relayA=true;  onRelayAChange();  showNextA=false; Serial.println("[Timer] A -> ON"); }
+  if (due(A_offAt_s,now_utc)){ A_offAt_s=0; saveTimers(); relayA=false; onRelayAChange();  showNextA=false; Serial.println("[Timer] A -> OFF"); }
+  if (due(B_onAt_s,now_utc)) { B_onAt_s=0; saveTimers(); relayB=true;  onRelayBChange();  showNextB=false; Serial.println("[Timer] B -> ON"); }
+  if (due(B_offAt_s,now_utc)){ B_offAt_s=0; saveTimers(); relayB=false; onRelayBChange();  showNextB=false; Serial.println("[Timer] B -> OFF"); }
+
+  if (A_onAt_s==0 && A_offAt_s==0 && B_onAt_s==0 && B_offAt_s==0){
+    showNextAll = false; showOnlyAll = false;
+  }
+
+  // Refresh NTP/RTC ทุก 30s
+  static unsigned long lastNtpCheck=0;
+  if (millis() - lastNtpCheck > 30000UL) {
+    time_t t = time(nullptr);
+    if (t > 1700000000) {
+      if (!ntpOK) Serial.println("[NTP] acquired.");
+      ntpOK = true;
+      if (rtcOK) {
+        uint32_t rtcNow = rtc.now().unixtime();
+        if (labs((long)rtcNow - (long)t) > 2) {
+          rtc.adjust(DateTime((uint32_t)t));
+          Serial.println("[RTC] re-sync from NTP.");
+        }
+      }
+    }
+    lastNtpCheck = millis();
+  }
+
+  /* ==== ส่งขึ้นชีตตามรอบเวลา หรือเมื่อมีเหตุ ==== */
+  if (needImmediatePost || (millis() - lastPostMs >= POST_INTERVAL_MS)) {
+    needImmediatePost = false;
+    lastPostMs = millis();
+    postToGoogleSheet();
+  }
+}
+
+/* ==== Cloud callbacks ==== */
+void onMsgCommandChange(){
+  if (g_echoing) { Serial.println("[CB] echo skip"); return; }
+  String raw = msgCommand;
+  Serial.println(String("[CB] onMsgCommandChange raw='")+raw+"' len="+raw.length());
+
+  String all = normalizeSpaces(raw); 
+  if (all.length()==0){ showSuggestions('?'); return; }
+
+  // === คาลิเบรตสเกลกระแส ===
+  if (all.startsWith("CAL A ")){
+    float target = all.substring(6).toFloat();
+    double s=0,s2=0; const int N=512; 
+    for(int i=0;i<N;i++){ int x=analogRead(ADC_I_A); s+=x; s2+=(double)x*(double)x; }
+    double m=s/N, v=s2/N - m*m; if(v<0)v=0; 
+    float norm=(float)(sqrt(v)/ADC_FULL_SCALE);
+    if (norm>0.0005f){ I_SCALE_A = target / norm; pushReply(String("[CAL] A: norm=")+String(norm,6)+" -> I_SCALE_A="+String(I_SCALE_A,3)); }
+    else pushReply("[CAL] A: norm too small");
+    return;
+  }
+  if (all.startsWith("CAL B ")){
+    float target = all.substring(6).toFloat();
+    double s=0,s2=0; const int N=512; 
+    for(int i=0;i<N;i++){ int x=analogRead(ADC_I_B); s+=x; s2+=(double)x*(double)x; }
+    double m=s/N, v=s2/N - m*m; if(v<0)v=0; 
+    float norm=(float)(sqrt(v)/ADC_FULL_SCALE);
+    if (norm>0.0005f){ I_SCALE_B = target / norm; pushReply(String("[CAL] B: norm=")+String(norm,6)+" -> I_SCALE_B="+String(I_SCALE_B,3)); }
+    else pushReply("[CAL] B: norm too small");
+    return;
+  }
+
+  // === ปรับออฟเซ็ตการใช้งาน (โชว์/พลังงาน/OC) ===
+  if (all.startsWith("BIAS A ")){
+    DISP_BIAS_A = all.substring(7).toFloat();
+    pushReply(String("[BIAS] A set to ")+String(DISP_BIAS_A,3)+" A");
+    return;
+  }
+  if (all.startsWith("BIAS B ")){
+    DISP_BIAS_B = all.substring(7).toFloat();
+    pushReply(String("[BIAS] B set to ")+String(DISP_BIAS_B,3)+" A");
+    return;
+  }
+  if (all.startsWith("BIAS BOTH ")){
+    float v = all.substring(10).toFloat();
+    DISP_BIAS_A = DISP_BIAS_B = v;
+    pushReply(String("[BIAS] A & B set to ")+String(v,3)+" A");
+    return;
+  }
+
+  // === จับฐานใหม่ทันที ===
+  if (toUpperAscii(all)=="ZERO" || toUpperAscii(all)=="FORCE ZERO"){
+    iA_base_norm = measureCurrentBaseNorm(ADC_I_A);
+    iB_base_norm = measureCurrentBaseNorm(ADC_I_B);
+    pushReply(String("[ZERO] iA_base_norm=")+String(iA_base_norm,6)+"  iB_base_norm="+String(iB_base_norm,6));
+    return;
+  }
+
+  // คำสั่งสั้น ๆ เปิด/ปิดทันที
+  if (toUpperAscii(all)=="A ON")  { relayA=true;  onRelayAChange(); pushReply("A → เปิดเดี๋ยวนี้"); return; }
+  if (toUpperAscii(all)=="A OFF") { relayA=false; onRelayAChange(); pushReply("A → ปิดเดี๋ยวนี้"); return; }
+  if (toUpperAscii(all)=="B ON")  { relayB=true;  onRelayBChange(); pushReply("B → เปิดเดี๋ยวนี้"); return; }
+  if (toUpperAscii(all)=="B OFF") { relayB=false; onRelayBChange(); pushReply("B → ปิดเดี๋ยวนี้"); return; }
+  if (toUpperAscii(all)=="HELP" || all=="?"){ showSuggestions('?'); return; }
+
+  // ===== รองรับหลายคำสั่งคั่นด้วย comma =====
+  int start=0; bool anyOK=false;
+  while (start < (int)all.length()){
+    int comma = all.indexOf(',', start);
+    String part = (comma>=0)? all.substring(start, comma) : all.substring(start);
+    part.trim(); 
+    start = (comma>=0)? comma+1 : all.length(); 
+    if (part.length()==0) continue;
+
+    String who, act, tail; 
+    split3Tokens(part, who, act, tail);
+
+    if (act.length()==0 || act=="?" || act=="？"){
+      if (isAny(who,"A",nullptr,nullptr)) showSuggestions('A');
+      else if (isAny(who,"B",nullptr,nullptr)) showSuggestions('B');
+      else if (isAny(who,"ALL","ทั้งหมด",nullptr)) showSuggestions('X');
+      else showSuggestions('?');
+      anyOK=true; 
+      continue;
+    }
+
+    char which=0;
+    if (isAny(who,"A",nullptr,nullptr)) which='A';
+    else if (isAny(who,"B",nullptr,nullptr)) which='B';
+    else if (isAny(who,"ALL","ทั้งหมด",nullptr)) which='X';
+    else { Serial.println("[Msg] Skip (WHO?): "+part); continue; }
+
+    bool isCancel=false, turnOn=false;
+    if (isAny(act,"ON","OPEN","เปิด")) turnOn=true;
+    else if (isAny(act,"OFF","CLOSE","ปิด")) turnOn=false;
+    else if (isAny(act,"CANCEL","ยกเลิก",nullptr)) isCancel=true;
+    else { Serial.println("[Msg] Skip (ACTION?): "+part); continue; }
+
+    if (isCancel){ 
+      cancelTimers(which?which:'X'); 
+      anyOK=true; 
+      continue; 
+    }
+
+    bool handledAbs=false;
+    if (tail.length()>0){
+      int _h,_m;
+      if (hasAtKeyword(tail) || findHHMM(tail, _h, _m)){
+        uint32_t whenUTC = parseLocalHHMM_toUTC(tail);
+        if (whenUTC != 0){ 
+          scheduleActionAt(which?which:'X', turnOn, whenUTC); 
+          anyOK=true; 
+          handledAbs=true; 
+        }
+      }
+    }
+    if (handledAbs) continue;
+
+    int mins = parseDurationToMinutes(tail);
+    scheduleAction(which?which:'X', turnOn, mins); 
+    anyOK=true;
+  }
+
+  if (!anyOK) showSuggestions('?');
+}
+
+void onRelayAChange(){ if (relayA) latchedA=false; digitalWrite(RELAY_A_PIN, relayA?RELAY_ON:RELAY_OFF); }
+void onRelayBChange(){ if (relayB) latchedB=false; digitalWrite(RELAY_B_PIN, relayB?RELAY_ON:RELAY_OFF); }
+void onResetEnergyChange(){ if (resetEnergy){ energyWh=0.0f; resetEnergy=false; Serial.println("[Cloud] Energy reset."); } }
+
+/* ==== ส่งขึ้นชีต (GET) ==== */
+void postToGoogleSheet(){
+  WiFiClientSecure client; client.setInsecure();
+  HTTPClient https;
+  https.setTimeout(8000);
+  https.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+
+  String url = String(SCRIPT_URL) + "?k=" + SHEET_SECRET
+    + "&swA=" + (relayA ? "true":"false")
+    + "&swB=" + (relayB ? "true":"false")
+    + "&iIn=" + String(currentAll,3)        // กระแสรวม (SUM) หลัง bias
+    + "&vIn=" + String(voltageAll,1)
+    + "&vA="  + String(voltageA,1)
+    + "&vB="  + String(voltageB,1)
+    + "&iA="  + String(currentA,3)          // กระแสหลัง bias
+    + "&iB="  + String(currentB,3)          // กระแสหลัง bias
+    + "&pA="  + String(powerA,2)
+    + "&pB="  + String(powerB,2)
+    + "&tC="  + String(tempC,1)
+    + "&hum=" + String(humidity,1)
+    + "&tripA=" + (tripA_flag ? "true":"false")
+    + "&tripB=" + (tripB_flag ? "true":"false")
+    // === ค่าสรุป ===
+    + "&dWh="      + String(dailyWh,2)
+    + "&wWh="      + String(weeklyWh,2)
+    + "&dWhPrev="  + String(dailyWhPrev,2)
+    + "&wWhPrev="  + String(weeklyWhPrev,2);
+
+  if (!https.begin(client, url)) { Serial.println("[Sheet] begin() failed"); return; }
+  int code = https.GET();
+  String resp = https.getString();
+  https.end();
+  Serial.printf("[Sheet] GET %d: %s\n", code, resp.c_str());
+
+  tripA_flag = false; tripB_flag = false;
+}
+
+/*
+  Since MsgCommand is READ_WRITE variable, onMsgCommandChange() is
+  executed every time a new value is received from IoT Cloud.
+*/
+void onMsgCommandChange()  {
+  // Add your code here to act upon MsgCommand change
+}
+/*
+  Since RelayA is READ_WRITE variable, onRelayAChange() is
+  executed every time a new value is received from IoT Cloud.
+*/
+void onRelayAChange()  {
+  // Add your code here to act upon RelayA change
+}
+/*
+  Since RelayB is READ_WRITE variable, onRelayBChange() is
+  executed every time a new value is received from IoT Cloud.
+*/
+void onRelayBChange()  {
+  // Add your code here to act upon RelayB change
+}
+/*
+  Since ResetDaily is READ_WRITE variable, onResetDailyChange() is
+  executed every time a new value is received from IoT Cloud.
+*/
+void onResetDailyChange()  {
+  // Add your code here to act upon ResetDaily change
+}
+/*
+  Since ResetEnergy is READ_WRITE variable, onResetEnergyChange() is
+  executed every time a new value is received from IoT Cloud.
+*/
+void onResetEnergyChange()  {
+  // Add your code here to act upon ResetEnergy change
+}
+/*
+  Since ResetWeekly is READ_WRITE variable, onResetWeeklyChange() is
+  executed every time a new value is received from IoT Cloud.
+*/
+void onResetWeeklyChange()  {
+  // Add your code here to act upon ResetWeekly change
+}
