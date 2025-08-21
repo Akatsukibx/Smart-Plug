@@ -1,0 +1,131 @@
+/***** CONFIG *****/
+const DATA_SHEET    = 'Data';
+const LOG_SHEET     = 'Log';
+const SUMMARY_SHEET = 'Summary';
+const EXPECTED      = 'Smart_Plug';
+
+/***** HTTP Entrypoints *****/
+function doPost(e){ return handleReq(e, 'POST'); }
+function doGet(e){  return handleReq(e, 'GET');  }
+
+/***** Main *****/
+function handleReq(e, method){
+  const ss    = SpreadsheetApp.getActive();
+  const dataSh= ss.getSheetByName(DATA_SHEET)    || ss.insertSheet(DATA_SHEET);
+  const logSh = ss.getSheetByName(LOG_SHEET)     || ss.insertSheet(LOG_SHEET);
+  const sumSh = ss.getSheetByName(SUMMARY_SHEET) || ss.insertSheet(SUMMARY_SHEET);
+
+  ensureDataHeader_(dataSh);
+  ensureSummaryHeader_(sumSh);
+
+  const safe    = e || {};
+  const headers = safe.headers || {};
+  const raw     = (safe.postData && safe.postData.contents) || '';
+  let d = {};
+  try {
+    try { d = JSON.parse(raw || '{}'); } catch(_) {}
+    if (!Object.keys(d).length && Object.keys(safe.parameter || {}).length) d = safe.parameter;
+    if (!Object.keys(d).length && raw) d = parsePlain(raw);
+  } catch (err) {
+    logSh.appendRow([new Date(), method, 'parse-error', String(err), raw]);
+    return ContentService.createTextOutput('BAD_PAYLOAD');
+  }
+
+  // auth
+  const secret = headers['x-secret'] || headers['X-Secret'] || (d.k || d.K) ||
+                 (safe.parameter && (safe.parameter.k || safe.parameter.K)) || '';
+  const ok = EXPECTED ? (secret === EXPECTED) : true;
+  logSh.appendRow([new Date(), method, (ok?'ok':'bad'), JSON.stringify(d)]);
+  if (!ok) return ContentService.createTextOutput('FORBIDDEN');
+
+  // ---------- Data: ใส่ค่า R,S เป็น 0 ถ้ายังไม่มี ----------
+  // รองรับชื่อคีย์หลายแบบจากเฟิร์มแวร์
+  const dailyPrev  = val0(d.dailyPrev, d.dWhPrev, d.dailyWhPrev);       // R
+  const weeklyPrev = val0(d.weeklyPrev, d.wWhPrev, d.weeklyWhPrev);     // S
+
+  const row = [
+    new Date(),            // A ts
+    onoff(d.swA),          // B
+    onoff(d.swB),          // C
+    num0(d.iIn),           // D
+    num0(d.vIn),           // E
+    num0(d.vA),            // F
+    num0(d.vB),            // G
+    num0(d.iA),            // H
+    num0(d.iB),            // I
+    num0(d.pA),            // J
+    num0(d.pB),            // K
+    num0(d.tC),            // L
+    num0(d.hum),           // M
+    tripText(d.tripA),     // N
+    tripText(d.tripB),     // O
+    num0(d.dWh, d.dailyWh),// P running (รับได้ทั้ง dWh/dailyWh)
+    num0(d.wWh, d.weeklyWh),// Q running (รับได้ทั้ง wWh/weeklyWh)
+    dailyPrev,             // R yesterday closed (0 ถ้ายังไม่มี)
+    weeklyPrev             // S last-week closed (0 ถ้ายังไม่มี)
+  ];
+  dataSh.appendRow(row);
+
+  // ---------- Summary: เฉพาะตอนปิดรอบ ----------
+  if ( String(d.summ||'') === '1' ) {
+    const S_daily     = num0(d.dailyWh);        // today (หลัง reset จะเป็น 0)
+    const S_dailyPrev = num0(d.dailyWhPrev, d.dWhPrev);
+    const S_weekly    = num0(d.weeklyWh, d.wWh);
+    const S_weeklyPrev= num0(d.weeklyWhPrev, d.wWhPrev);
+
+    sumSh.appendRow([
+      new Date(),        // A ts
+      S_daily,           // B dailyWh (ปัจจุบันหลังปิดรอบ)
+      S_dailyPrev,       // C dailyWhPrev (ยอดของ “เมื่อวาน”)
+      S_weekly,          // D weeklyWh (ยอดสัปดาห์ปัจจุบันหลังปิดรอบถ้ามี)
+      S_weeklyPrev       // E weeklyWhPrev (ยอดสัปดาห์ก่อนถ้ามี)
+    ]);
+    logSh.appendRow([new Date(), 'summary', S_daily, S_dailyPrev, S_weekly, S_weeklyPrev]);
+  }
+
+  SpreadsheetApp.flush();
+  return ContentService.createTextOutput('OK');
+}
+
+/***** Helpers *****/
+function num0(){                      // แปลงเป็น Number ถ้าไม่ได้ให้เป็น 0
+  for (let i=0;i<arguments.length;i++){
+    const v = arguments[i];
+    if (v === '' || v === null || v === undefined) continue;
+    const n = Number(v);
+    if (isFinite(n)) return n;
+  }
+  return 0;
+}
+function val0(){ return num0.apply(null, arguments); } // alias อ่านง่าย
+function isTrue(v){
+  return v===true || v===1 || v==='1' ||
+         String(v).toLowerCase()==='true' || v==='เปิด' || v==='ตัดแล้ว';
+}
+function onoff(v){ return isTrue(v) ? 'เปิด' : 'ปิด'; }
+function tripText(v){ return isTrue(v) ? 'ตัดแล้ว' : 'ปกติ'; }
+
+function ensureDataHeader_(sh){
+  if (sh.getLastRow() === 0){
+    sh.appendRow([
+      'ts','swA','swB','iIn','vIn','vA','vB','iA','iB','pA','pB',
+      'tC','hum','tripA','tripB',
+      'dailyWh','weeklyWh',      // P, Q running
+      'dailyWhPrev(Data)','weeklyWhPrev(Data)' // R,S: แถว Data จะเติม 0 ถ้าไม่มี
+    ]);
+  }
+}
+function ensureSummaryHeader_(sh){
+  if (sh.getLastRow() === 0){
+    sh.appendRow(['ts','dailyWh','dailyWhPrev','weeklyWh','weeklyWhPrev']); // D,E จะเป็น 0 ถ้าไม่ส่งมา
+  }
+}
+
+function parsePlain(raw){
+  const res={};
+  raw.split(/[\n&]+/).forEach(pair=>{
+    const [k,...rest]=pair.split('=');
+    if (k) res[k.trim()] = (rest.join('=')||'').trim();
+  });
+  return res;
+}
