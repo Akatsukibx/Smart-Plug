@@ -1,29 +1,32 @@
-/***** CONFIG *****/
-const DATA_SHEET    = 'Data';
-const LOG_SHEET     = 'Log';
+/************* CONFIG *************/
+const DATA_SHEET = 'Data';
+const LOG_SHEET  = 'Log';
 const SUMMARY_SHEET = 'Summary';
-const EXPECTED      = 'Smart_Plug';
+const EXPECTED   = 'Smart_Plug';
+const TZ         = 'Asia/Bangkok';
 
-/***** HTTP Entrypoints *****/
+/************* Web App Entrypoints *************/
 function doPost(e){ return handleReq(e, 'POST'); }
 function doGet(e){  return handleReq(e, 'GET');  }
 
-/***** Main *****/
+/************* Main Handler *************/
 function handleReq(e, method){
-  const ss    = SpreadsheetApp.getActive();
-  const dataSh= ss.getSheetByName(DATA_SHEET)    || ss.insertSheet(DATA_SHEET);
-  const logSh = ss.getSheetByName(LOG_SHEET)     || ss.insertSheet(LOG_SHEET);
-  const sumSh = ss.getSheetByName(SUMMARY_SHEET) || ss.insertSheet(SUMMARY_SHEET);
+  const ss = SpreadsheetApp.getActive();
+  const dataSh = ss.getSheetByName(DATA_SHEET) || ss.insertSheet(DATA_SHEET);
+  const logSh  = ss.getSheetByName(LOG_SHEET)  || ss.insertSheet(LOG_SHEET);
+  const sumSh  = ss.getSheetByName(SUMMARY_SHEET) || ss.insertSheet(SUMMARY_SHEET);
 
   ensureDataHeader_(dataSh);
   ensureSummaryHeader_(sumSh);
 
-  const safe    = e || {};
+  // ---- Parse payload ----
+  const safe = e || {};
   const headers = safe.headers || {};
-  const raw     = (safe.postData && safe.postData.contents) || '';
+  const ct = String(headers['content-type'] || headers['Content-Type'] || (safe.postData && safe.postData.type) || '').toLowerCase();
+  const raw = (safe.postData && safe.postData.contents) || '';
   let d = {};
   try {
-    try { d = JSON.parse(raw || '{}'); } catch(_) {}
+    try { d = JSON.parse(raw || '{}'); } catch (_) {}
     if (!Object.keys(d).length && Object.keys(safe.parameter || {}).length) d = safe.parameter;
     if (!Object.keys(d).length && raw) d = parsePlain(raw);
   } catch (err) {
@@ -31,98 +34,146 @@ function handleReq(e, method){
     return ContentService.createTextOutput('BAD_PAYLOAD');
   }
 
-  // auth
+  // ---- Auth (secret) ----
   const secret = headers['x-secret'] || headers['X-Secret'] || (d.k || d.K) ||
                  (safe.parameter && (safe.parameter.k || safe.parameter.K)) || '';
   const ok = EXPECTED ? (secret === EXPECTED) : true;
-  logSh.appendRow([new Date(), method, (ok?'ok':'bad'), JSON.stringify(d)]);
+
+  logSh.appendRow([new Date(), method, 'ct='+ct, 'secret='+(ok?'ok':'bad'), raw || JSON.stringify(d)]);
   if (!ok) return ContentService.createTextOutput('FORBIDDEN');
 
-  // ---------- Data: ใส่ค่า R,S เป็น 0 ถ้ายังไม่มี ----------
-  // รองรับชื่อคีย์หลายแบบจากเฟิร์มแวร์
-  const dailyPrev  = val0(d.dailyPrev, d.dWhPrev, d.dailyWhPrev);       // R
-  const weeklyPrev = val0(d.weeklyPrev, d.wWhPrev, d.weeklyWhPrev);     // S
-
-  const row = [
-    new Date(),            // A ts
-    onoff(d.swA),          // B
-    onoff(d.swB),          // C
-    num0(d.iIn),           // D
-    num0(d.vIn),           // E
-    num0(d.vA),            // F
-    num0(d.vB),            // G
-    num0(d.iA),            // H
-    num0(d.iB),            // I
-    num0(d.pA),            // J
-    num0(d.pB),            // K
-    num0(d.tC),            // L
-    num0(d.hum),           // M
-    tripText(d.tripA),     // N
-    tripText(d.tripB),     // O
-    num0(d.dWh, d.dailyWh),// P running (รับได้ทั้ง dWh/dailyWh)
-    num0(d.wWh, d.weeklyWh),// Q running (รับได้ทั้ง wWh/weeklyWh)
-    dailyPrev,             // R yesterday closed (0 ถ้ายังไม่มี)
-    weeklyPrev             // S last-week closed (0 ถ้ายังไม่มี)
+  // ---- Write Data (raw, ทุกนาที) ----
+  // หมายเหตุ: Data เก็บทุกอย่างตามเดิม รวมทั้ง dWh/wWh ที่วิ่งๆ ระหว่างวัน
+  const dataRow = [
+    new Date(),           // A ts
+    onoff(d.swA),         // B
+    onoff(d.swB),         // C
+    num(d.iIn),           // D
+    num(d.vIn),           // E
+    num(d.vA),            // F
+    num(d.vB),            // G
+    num(d.iA),            // H
+    num(d.iB),            // I
+    num(d.pA),            // J
+    num(d.pB),            // K
+    num(d.tC),            // L
+    num(d.hum),           // M
+    tripText(d.tripA),    // N
+    tripText(d.tripB),    // O
+    num(d.dWh),           // P  today running
+    num(d.wWh),           // Q  week running
+    num(d.dWhPrev),       // R  yesterday closed (ถ้าส่งมาก็เก็บไว้ตรวจสอบ)
+    num(d.wWhPrev)        // S  last-week closed (ถ้าส่งมาก็เก็บไว้ตรวจสอบ)
   ];
-  dataSh.appendRow(row);
-
-  // ---------- Summary: เฉพาะตอนปิดรอบ ----------
-  if ( String(d.summ||'') === '1' ) {
-    const S_daily     = num0(d.dailyWh);        // today (หลัง reset จะเป็น 0)
-    const S_dailyPrev = num0(d.dailyWhPrev, d.dWhPrev);
-    const S_weekly    = num0(d.weeklyWh, d.wWh);
-    const S_weeklyPrev= num0(d.weeklyWhPrev, d.wWhPrev);
-
-    sumSh.appendRow([
-      new Date(),        // A ts
-      S_daily,           // B dailyWh (ปัจจุบันหลังปิดรอบ)
-      S_dailyPrev,       // C dailyWhPrev (ยอดของ “เมื่อวาน”)
-      S_weekly,          // D weeklyWh (ยอดสัปดาห์ปัจจุบันหลังปิดรอบถ้ามี)
-      S_weeklyPrev       // E weeklyWhPrev (ยอดสัปดาห์ก่อนถ้ามี)
-    ]);
-    logSh.appendRow([new Date(), 'summary', S_daily, S_dailyPrev, S_weekly, S_weeklyPrev]);
-  }
-
+  dataSh.appendRow(dataRow);
   SpreadsheetApp.flush();
+
+  // ---- Summary: เขียนเฉพาะเมื่อเป็น "แพ็กเกจตัดรอบ" ตามรูปแบบใหม่ ----
+  // รูปแบบใหม่ (ส่งมาที่ Summary เฉพาะตอนตัด):
+  //   dailyWh, dailyWhPrev, weeklyWh, weeklyWhPrev  (จะส่งมาบางตัวก็ได้)
+  // รองรับ backward-compat: ถ้าอุปกรณ์ยังส่ง dWhPrev/wWhPrev มาอยู่ จะ map ให้ด้วย
+  writeSummary_STRICT_CUTS_(sumSh, d);
+
   return ContentService.createTextOutput('OK');
 }
 
-/***** Helpers *****/
-function num0(){                      // แปลงเป็น Number ถ้าไม่ได้ให้เป็น 0
-  for (let i=0;i<arguments.length;i++){
-    const v = arguments[i];
-    if (v === '' || v === null || v === undefined) continue;
-    const n = Number(v);
-    if (isFinite(n)) return n;
+/************* Summary (เฉพาะตอนตัดรอบ) *************/
+function ensureSummaryHeader_(sh){
+  if (sh.getLastRow() === 0){
+    // ตามรูป: ts | dailyWh | dailyWhPrev | weeklyWh | weeklyWhPrev
+    sh.appendRow(['ts','dailyWh','dailyWhPrev','weeklyWh','weeklyWhPrev']);
   }
-  return 0;
 }
-function val0(){ return num0.apply(null, arguments); } // alias อ่านง่าย
-function isTrue(v){
-  return v===true || v===1 || v==='1' ||
-         String(v).toLowerCase()==='true' || v==='เปิด' || v==='ตัดแล้ว';
-}
-function onoff(v){ return isTrue(v) ? 'เปิด' : 'ปิด'; }
-function tripText(v){ return isTrue(v) ? 'ตัดแล้ว' : 'ปกติ'; }
 
+/**
+ * เขียน Summary เฉพาะเมื่อเป็น "แพ็กเกจตัดรอบ" เท่านั้น
+ * - จะมองว่าเป็นตัดรอบก็ต่อเมื่อมี key ใดๆ ในชุด {dailyWh, dailyWhPrev, weeklyWh, weeklyWhPrev}
+ *   (รองรับ map จากชื่อเดิม: dWhPrev -> dailyWh / dailyWhPrev? ดูหมายเหตุด้านล่าง)
+ * - upsert วันละแถวเดียว โดยใช้วันที่ไทย (yyyy-MM-dd) เป็นคีย์ในคอลัมน์ ts
+ * - ค่าที่ไม่ถูกส่งมา จะใส่เป็น 0 (ตามภาพตัวอย่าง)
+ */
+function writeSummary_STRICT_CUTS_(sh, d){
+  // Map แบบ backward-compatibility
+  // กรณีบางอุปกรณ์ยังส่ง dWhPrev/wWhPrev มา:
+  // - ถ้าส่ง dWhPrev มาแต่ไม่ได้ส่ง dailyWh → จะตีความว่าเป็น "dailyWh" (ค่าที่ถูกตัดแล้วของวันก่อน)
+  // - ถ้าส่ง weeklyWhPrev มา → ใช้ตามชื่อใหม่เลย
+  const cuts = {
+    dailyWh:      (d.dailyWh !== undefined ? d.dailyWh : (d.dWhPrev !== undefined ? d.dWhPrev : undefined)),
+    dailyWhPrev:  (d.dailyWhPrev !== undefined ? d.dailyWhPrev : undefined),
+    weeklyWh:     (d.weeklyWh !== undefined ? d.weeklyWh : undefined),
+    weeklyWhPrev: (d.weeklyWhPrev !== undefined ? d.weeklyWhPrev : (d.wWhPrev !== undefined ? d.wWhPrev : undefined)),
+  };
+
+  const hasCut =
+    ('dailyWh' in cuts && cuts.dailyWh !== undefined) ||
+    ('dailyWhPrev' in cuts && cuts.dailyWhPrev !== undefined) ||
+    ('weeklyWh' in cuts && cuts.weeklyWh !== undefined) ||
+    ('weeklyWhPrev' in cuts && cuts.weeklyWhPrev !== undefined);
+
+  if (!hasCut) return; // ไม่ใช่แพ็กเกจตัดรอบ → ไม่แตะ Summary
+
+  // กำหนดวันที่สำหรับบันทึก (ถือเป็น "วันใหม่หลังตัด")
+  const tsDate = Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd');
+
+  // อ่านทั้งชีต
+  const rng = sh.getDataRange();
+  const values = rng.getValues();
+  if (values.length === 0){
+    ensureSummaryHeader_(sh);
+    values.push(['ts','dailyWh','dailyWhPrev','weeklyWh','weeklyWhPrev']);
+  }
+
+  // หาแถวของวันนี้
+  let idx = -1;
+  for (let i=1;i<values.length;i++){
+    if (String(values[i][0]) === tsDate){ idx = i; break; }
+  }
+
+  // ค่าเริ่มต้นเป็น 0 ตามภาพ
+  let row = [tsDate, 0, 0, 0, 0];
+  if (idx !== -1) row = values[idx];
+
+  // เติมเฉพาะช่องที่ส่งมา (เป็นตัวเลขเท่านั้น)
+  if (cuts.dailyWh      !== undefined) row[1] = safeNumZero_(cuts.dailyWh);
+  if (cuts.dailyWhPrev  !== undefined) row[2] = safeNumZero_(cuts.dailyWhPrev);
+  if (cuts.weeklyWh     !== undefined) row[3] = safeNumZero_(cuts.weeklyWh);
+  if (cuts.weeklyWhPrev !== undefined) row[4] = safeNumZero_(cuts.weeklyWhPrev);
+
+  if (idx === -1) sh.appendRow(row);
+  else sh.getRange(idx+1, 1, 1, row.length).setValues([row]);
+}
+
+/************* Data sheet helpers *************/
 function ensureDataHeader_(sh){
   if (sh.getLastRow() === 0){
     sh.appendRow([
       'ts','swA','swB','iIn','vIn','vA','vB','iA','iB','pA','pB',
       'tC','hum','tripA','tripB',
-      'dailyWh','weeklyWh',      // P, Q running
-      'dailyWhPrev(Data)','weeklyWhPrev(Data)' // R,S: แถว Data จะเติม 0 ถ้าไม่มี
+      'dailyWh','weeklyWh','dailyWhPrev','weeklyWhPrev'
     ]);
   }
 }
-function ensureSummaryHeader_(sh){
-  if (sh.getLastRow() === 0){
-    sh.appendRow(['ts','dailyWh','dailyWhPrev','weeklyWh','weeklyWhPrev']); // D,E จะเป็น 0 ถ้าไม่ส่งมา
-  }
+
+/************* Common helpers *************/
+function num(x){ return (x === '' || x === null || x === undefined) ? '' : Number(x); }
+function isTrue(v){ return v===true || v===1 || v==='1' || String(v).toLowerCase()==='true' || v==='เปิด' || v==='ตัดแล้ว'; }
+function onoff(v){ return isTrue(v) ? 'เปิด' : 'ปิด'; }
+function tripText(v){ return isTrue(v) ? 'ตัดแล้ว' : 'ปกติ'; }
+
+function safeNumZero_(v){
+  const n = Number(v);
+  return (isNaN(n) ? 0 : n);
 }
 
+/** รองรับ payload แบบ key=value หรือคั่นด้วยคอมมา/ท่อ */
 function parsePlain(raw){
   const res={};
+  const parts = raw.split(/[,|]/).map(s=>s.trim());
+  if (parts.length >= 18){
+    [res.swA,res.swB,res.iIn,res.vIn,res.vA,res.vB,res.iA,res.iB,res.pA,res.pB,res.tC,res.hum,res.tripA,res.tripB,
+     res.dWh,res.wWh,res.dWhPrev,res.wWhPrev] = parts;
+    return res;
+  }
   raw.split(/[\n&]+/).forEach(pair=>{
     const [k,...rest]=pair.split('=');
     if (k) res[k.trim()] = (rest.join('=')||'').trim();
