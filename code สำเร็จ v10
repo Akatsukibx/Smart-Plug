@@ -14,7 +14,7 @@
 /* ==== ส่ง Google Sheet (ใช้ GET) ==== */
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
-const char* SCRIPT_URL   = "https://script.google.com/macros/s/AKfycbylxC9APFh1zh0285abGVPuL6GyFvJcNCbZqLcHZkPcDoBgWSDopGGrN1VvbolhT_5vag/exec";
+const char* SCRIPT_URL   = "https://script.google.com/macros/s/AKfycbzHD41mb4CpTYHn7QDbLFaC21BSrDaKIkUTSwW9hurj9Jnkr8GG_TAHqO8i58GlzNKHkA/exec";
 const char* SHEET_SECRET = "Smart_Plug";
 const unsigned long POST_INTERVAL_MS = 60000UL;
 unsigned long lastPostMs = 0;
@@ -23,8 +23,8 @@ static bool tripA_flag = false;
 static bool tripB_flag = false;
 
 /* ==== Reset Time Config ==== */ // เวลารีเซ็ต 
-const int RESET_HOUR = 23;   // 00-23 
-const int RESET_MIN  = 58;   // 00-59
+const int RESET_HOUR = 00;   // 00-23 
+const int RESET_MIN  = 30;   // 00-59
 #define STBY_REPEAT_MIN 60   // ระยะเวลาซ้ำ (นาที)
 /* ===== Pin map ===== */
 #ifndef D2
@@ -195,6 +195,82 @@ String urlEncode(const String &s) {
   return out;
 }
 
+/* -----------------------------------------------------------------
+   ===== [ADD ONLY] Rolling 7-day history (NVS) – minimal impl =====
+   ----------------------------------------------------------------- */
+Preferences prefHist;
+
+// คืนค่า: จำนวนรายการที่โหลดได้ (0..7) และเติม out[0..n-1]
+int hist7_load(float out[7]) {
+  for (int i=0;i<7;i++) out[i]=0.0f;
+  prefHist.begin("hist7", /*rw=*/true);
+  uint8_t n     = prefHist.getUChar("n", 0);
+  uint8_t head  = prefHist.getUChar("head", 0);   // next write index (0..6)
+  int     ymd   = prefHist.getInt("ymd", 0);      // ล่าสุดที่บันทึก (กันซ้ำวันเดียวกัน)
+  (void)ymd;
+  if (n>7) n=7;
+
+  // ดึงตามลำดับเก่า->ใหม่
+  for (uint8_t i=0;i<n;i++){
+    uint8_t idx = (uint8_t)(( (head + 7) - n + i) % 7);
+    String key  = String("v") + String((int)idx);
+    out[i] = prefHist.getFloat(key.c_str(), 0.0f);
+  }
+  prefHist.end();
+  return (int)n;
+}
+
+// ดันค่าใหม่เข้า buffer (สูงสุด 7 ค่า, วนรอบ)
+void hist7_push(float todayWh, int todayYmd) {
+  prefHist.begin("hist7", /*rw=*/true);
+  uint8_t n     = prefHist.getUChar("n", 0);
+  uint8_t head  = prefHist.getUChar("head", 0);
+  int     lastY = prefHist.getInt("ymd", 0);
+
+  // กันการบันทึกซ้ำวันเดียวกัน
+  if (lastY == todayYmd) { prefHist.end(); return; }
+
+  String key = String("v") + String((int)head);
+  prefHist.putFloat(key.c_str(), (float)todayWh);
+
+  head = (uint8_t)((head + 1) % 7);
+  if (n < 7) n++;
+
+  prefHist.putUChar("head", head);
+  prefHist.putUChar("n", n);
+  prefHist.putInt("ymd", todayYmd);
+  prefHist.end();
+
+  Serial.printf("[HIST7] push ymd=%d val=%.2f (n=%u head=%u)\n", todayYmd, todayWh, n, head);
+}
+/* -------------------- END [ADD ONLY] -------------------- */
+
+/* ==== (NEW) avg7 helper: วันแรกให้แสดง ±0.00% ได้เลย ==== */
+static const float EPSILON = 1e-6f;
+static bool compute_avg7_and_delta(float todayWh, float& avg7, float& diffPct){
+  float arr[7]; 
+  int n = hist7_load(arr);
+  double sum = 0.0; 
+  int m = 0;
+
+  for (int i = 0; i < n; i++){
+    if (fabsf(arr[i]) > EPSILON) {  // นับเฉพาะค่าที่ไม่เป็นศูนย์/ขยะ
+      sum += arr[i];
+      m++;
+    }
+  }
+
+  if (m == 0) {
+    avg7 = todayWh;
+    diffPct = 0.0f;
+    return true;
+  }
+
+  avg7 = (float)(sum / m);
+  diffPct = (avg7 > EPSILON) ? ((todayWh - avg7) / avg7) * 100.0f : 0.0f;
+  return true;
+}
+
 /* ===== RTC / Time ===== */
 RTC_DS3231 rtc; bool rtcOK=false, ntpOK=false;
 const long TZ_OFFSET_SEC = 7L*3600L; // Asia/Bangkok
@@ -333,9 +409,9 @@ void cancelTimers(char which){
   if(which=='X'){ showNextAll=false; showOnlyAll=false; }
   saveTimers();
   pushReply(whoStr(which)+" ยกเลิกตัวจับเวลาแล้ว");
-  statusNow = "";            // force invalidation of previous text
-  updateStatusNow();         // refresh text now
-  ArduinoCloud.update();     // push to cloud immediately
+  statusNow = "";
+  updateStatusNow();
+  ArduinoCloud.update();
 }
 
 String relStr(uint32_t when){ if(!when) return ""; return formatWhenRelativeUTC(when); }
@@ -377,67 +453,10 @@ bool didResetToday=false;
 /* === โหมดกู้ข้อมูลพลังงานจาก NVS === */
 #define ENERGY_RESTORE_MODE 2  // 2 = กู้เสมอ
 
-/* ==== (NEW) ธงสำหรับการส่งสรุปรายวันพร้อมคำแนะนำ ==== */
+/* ==== (NEW) ธงสำหรับการส่งสรุปรายวัน/สัปดาห์ พร้อมคำแนะนำ ==== */
 bool g_justDailyReset = false;
 bool g_clearAdviceAfterPost = false;
-
-/* ==== (NEW) Rolling 7 วัน (เก็บใน NVS) + เปรียบเทียบ % ==== */
-Preferences prefHist;
-static const char* HIST_NS = "hist7";
-static const float EPSILON = 0.01f;  // เลี่ยงชื่อชน EPS ใน core
-
-static void hist7_push(float dWh){
-  prefHist.begin(HIST_NS, /*readOnly=*/false);
-  int head  = prefHist.getInt("head", -1);
-  int count = prefHist.getInt("count", 0);
-  head = (head + 1) % 7;
-  char key[8]; snprintf(key, sizeof(key), "w%d", head);
-  prefHist.putFloat(key, (float)dWh);    // key เป็น const char*
-  if (count < 7) count++;
-  prefHist.putInt("head", head);
-  prefHist.putInt("count", count);
-  prefHist.end();
-}
-
-static int hist7_load(float* out){ // คืน n = จำนวนค่าที่มี (สูงสุด 7)
-  prefHist.begin(HIST_NS, /*readOnly=*/true);
-  int head  = prefHist.getInt("head", -1);
-  int count = prefHist.getInt("count", 0);
-  if (count > 7) count = 7;
-  int n = 0;
-  for (int i=0;i<count;i++){
-    int pos = (head - i);
-    while (pos < 0) pos += 7;
-    char key[8]; snprintf(key, sizeof(key), "w%d", pos);
-    out[n++] = prefHist.getFloat(key, 0.0f);
-  }
-  prefHist.end();
-  return n;
-}
-
-static bool compute_avg7_and_delta(float todayWh, float& avg7, float& diffPct){
-  float arr[7]; int n = hist7_load(arr);
-  if (n <= 0) { avg7 = 0; diffPct = 0; return false; }
-  double sum = 0.0; int m = 0;
-  for (int i=0;i<n;i++){
-    if (fabsf(arr[i]) > EPSILON) { sum += arr[i]; m++; }
-  }
-  if (m == 0) { avg7 = 0; diffPct = 0; return false; }
-  avg7 = (float)(sum / m);
-  if (avg7 > EPSILON){
-    diffPct = ((todayWh - avg7) / avg7) * 100.0f;
-  }else{
-    diffPct = 0.0f;
-  }
-  return true;
-}
-
-static String fmtSignedPct(float x){
-  char b[16];
-  // ปัดทศนิยม 0.01%
-  snprintf(b, sizeof(b), "%+.2f%%", (double)x);
-  return String(b);
-}
+bool g_justWeeklyReset = false;   // <— NEW
 
 void updateEnergySummaries(double powerTotalW){
   const double dWhInc = powerTotalW * (1.0/3600.0);
@@ -452,31 +471,25 @@ void updateEnergySummaries(double powerTotalW){
   }
 
   if (!didResetToday && loc.hour()==RESET_HOUR && loc.minute()==RESET_MIN){
-    // ปิดรอบ: สรุป "ของวันนี้" ไปรวมไว้ใน g_dailyWhPrev
     g_dailyWhPrev = g_dailyWh; g_dailyWh = 0.0;
     if (g_dailyWhPrev < 0) g_dailyWhPrev = 0;
-
-    // คำนวณเทียบ avg 7 วัน (ใช้ค่าที่เก็บไว้ก่อนหน้า ยังไม่ push วันนี้)
-    float avg7=0, pct=0; bool haveAvg = compute_avg7_and_delta((float)g_dailyWhPrev, avg7, pct);
-
-    // ข้อความสรุป (ยังคงรูปแบบเดิม + เพิ่มเทียบ 7 วัน + tip)
     String ds = "ใช้ไฟวันนี้: " + String((float)round2(g_dailyWhPrev), 2) + " Wh";
-    if (haveAvg){
-      ds += " สูง/ต่ำกว่าค่าเฉลี่ย 7 วัน " + fmtSignedPct(pct);
-    }
     ds += " | แนะนำ: " + getTip();
     dailySummary = ds;
 
-    // หลังจากสร้างข้อความแล้ว ค่อย push ค่าเข้า rolling 7
-    hist7_push((float)g_dailyWhPrev);
+    // --- บันทึกค่าเมื่อวานลงประวัติ 7 วัน ---
+    int todayYmd = loc.year()*10000 + loc.month()*100 + loc.day();
+    hist7_push((float)g_dailyWhPrev, todayYmd);
+    // --- END ---
 
     DateTime yesterday = loc - TimeSpan(1,0,0,0);
     if (yesterday.dayOfTheWeek() == 2){
       g_weeklyWhPrev = g_weeklyWh; g_weeklyWh = 0.0;
       if (g_weeklyWhPrev < 0) g_weeklyWhPrev = 0;
       String ws = "ใช้ไฟสัปดาห์ก่อน: " + String((float)round2(g_weeklyWhPrev), 2) + " Wh";
-      ws += " | แนะนำ: " + getTip();
+      ws += " | แนะนำ: " + getTip();        // ← มีคำแนะนำเหมือน daily
       weeklySummary = ws;
+      g_justWeeklyReset = true;              // ← NEW: แจ้งให้ POST แนบ weeklySummary
     }
 
     didResetToday = true;
@@ -484,8 +497,8 @@ void updateEnergySummaries(double powerTotalW){
     needImmediatePost = true;
 
     persistEnergyIfNeeded();
-    g_justDailyReset = true;          // ให้ postToGoogleSheet แนบ adviceSummary
-    g_clearAdviceAfterPost = true;    // เคลียร์หลังส่ง
+    g_justDailyReset = true;
+    g_clearAdviceAfterPost = true;
     Serial.println("[ENERGY] closed daily (and weekly if Tue).");
   }
 
@@ -607,7 +620,7 @@ void setup(){
   delay(1500);
   Serial.println("[BOOT] Smart Plug]");
 
-  loadEnergyStateAtBoot();   // <— ย้ายมาไว้หลัง Serial.begin()
+  loadEnergyStateAtBoot();
 
   initProperties();
   ArduinoCloud.begin(ArduinoIoTPreferredConnection);
@@ -876,7 +889,7 @@ void loop(){
       addAdvice("ปลั๊ก A กระแสเกิน — ตัดโหลดอัตโนมัติ");
       tripA_flag = true; needImmediatePost = true;
     }else{
-      setAlertMessage("plugB กระแสเกิน(" + fmt2(LIMIT_B) + "A) ตัดโหลดแล้ว");
+      setAlertMessage("ปลั๊ก B กระแสเกิน(" + fmt2(LIMIT_B) + "A) ตัดโหลดแล้ว");
       addAdvice("ปลั๊ก B กระแสเกิน — ตัดโหลดอัตโนมัติ");
       tripB_flag = true; needImmediatePost = true;
     }
@@ -919,7 +932,6 @@ void loop(){
 }
 
 /* ==== Cloud callbacks ==== */
-// ← เพิ่ม callback เปล่า ๆ เพื่อแก้ undefined reference (ไม่แตะตรรกะอื่น)
 void onStandbyAlertChange() { /* no-op */ }
 
 void onMsgCommandChange(){
@@ -1059,11 +1071,17 @@ void postToGoogleSheet(){
     + "&dWhPrev="  + String(dailyWhPrev,2)
     + "&wWhPrev="  + String(weeklyWhPrev,2);
 
-  // (NEW) ถ้าเป็นการตัดรอบรายวัน ให้แนบ dailySummary + adviceSummary ไปด้วย
+  // ถ้าเป็นการตัดรอบรายวัน ให้แนบ dailySummary + adviceSummary ไปด้วย
   if (g_justDailyReset) {
     url += "&dailySummary="  + urlEncode(dailySummary);
     url += "&adviceSummary=" + urlEncode(gAdviceSummary);
     url += "&ct=summary";
+  }
+
+  // NEW: ถ้าเป็นการตัดรอบรายสัปดาห์ ให้แนบ weeklySummary ไปด้วย
+  if (g_justWeeklyReset) {
+    url += "&weeklySummary=" + urlEncode(weeklySummary);
+    url += "&ct=weekly";
   }
 
   if (!https.begin(client, url)) { Serial.println("[Sheet] begin() failed"); return; }
@@ -1077,6 +1095,10 @@ void postToGoogleSheet(){
     clearAdvice();
     g_clearAdviceAfterPost = false;
     g_justDailyReset = false;
+  }
+  // เคลียร์ธงรายสัปดาห์
+  if (g_justWeeklyReset) {
+    g_justWeeklyReset = false;
   }
 
   tripA_flag = false; tripB_flag = false;
@@ -1099,8 +1121,9 @@ void onResetWeeklyChange() {
     energyWh = 0.0f;
     g_weeklyWh = 0.0;     weeklyWh = 0.0;
     g_weeklyWhPrev = 0.0; weeklyWhPrev = 0.0;
-    weeklySummary = "ใช้ไฟสัปดาห์ก่อน: 0.00 Wh";
+    weeklySummary = "ใช้ไฟสัปดาห์ก่อน: 0.00 Wh | แนะนำ: " + getTip();  // ให้มีคำแนะนำด้วย
     needImmediatePost = true;
+    g_justWeeklyReset = true;   // ถ้ารีเซ็ตด้วยมือ จะส่ง weeklySummary ด้วย
     resetWeekly = false;
     Serial.println("[Cloud] Reset WEEKLY: energyWh + weeklyWh + weeklyWhPrev cleared.");
   }
@@ -1111,7 +1134,6 @@ void onResetWeeklyChange() {
 #include "freertos/task.h"
 #endif
 
-// helper ตราประทับเวลา HH:MM (เขตเวลาไทย)
 static String hhmmNow(){
   DateTime loc(nowUtc() + TZ_OFFSET_SEC);
   char buf[6];
@@ -1119,44 +1141,37 @@ static String hhmmNow(){
   return String(buf);
 }
 
-// ใช้ standbyAlert เป็นช่องทางแจ้งเตือนใหม่ (ไม่ปะปน ocAlert)
-// -> เติมเวลา+ลำดับ เพื่อให้ค่าต่างกันทุกครั้ง แอปจะขึ้น Activity ทุกครั้ง
 void setStandbyAlert(const String& s){
   static uint32_t seq = 0;
   String msg = s + " @" + hhmmNow() + " #" + String(++seq);
-  standbyAlert = msg;        // Cloud variable ใหม่ (ค่าไม่ซ้ำ)
-  msgReply     = msg;        // แสดงในช่องข้อความเดิมด้วย (optional)
+  standbyAlert = msg;
+  msgReply     = msg;
   needImmediatePost = true;
-  ArduinoCloud.update();     // ดันขึ้น Cloud ทันที
+  ArduinoCloud.update();
   Serial.println("[Standby] " + msg);
-  // (NEW) เก็บเป็นคำแนะนำในสรุปรายวัน
   addAdvice(s);
 }
 
-// สถานะภายใน (รายวัน)
 static bool advisedStandbyA = false, advisedStandbyB = false;
 static unsigned long standbyStartA = 0, standbyStartB = 0;
 
-// รีเซ็ตแฟล็กเมื่อล่วงวัน (อ้างอิงเขตเวลาเดียวกับระบบหลัก)
 static inline int ymd_local_from_utc(uint32_t utc){
   DateTime loc(utc + TZ_OFFSET_SEC);
   return ymd_from_DateTime(loc);
 }
 
-// ลูปตรวจสอบแบบ background (1s)
 static void StandbyTask(void*){
   const float STBY_MIN_W = 3.0f, STBY_MAX_W = 10.0f;
-  const unsigned long STBY_HOLD_MS = 60UL * 60UL * 1000UL; // 60 นาที (ยังเก็บไว้เผื่อใช้)
+  const unsigned long STBY_HOLD_MS = 60UL * 60UL * 1000UL;
   unsigned long lastTick = millis();
   int lastYmd = ymd_local_from_utc(nowUtc());
 
   for(;;){
-    vTaskDelay(pdMS_TO_TICKS(200));               // ไม่หน่วงหนัก
+    vTaskDelay(pdMS_TO_TICKS(200));
     unsigned long nowMs = millis();
-    if (nowMs - lastTick < 1000UL) continue;      // ประมาณทุก ~1s
+    if (nowMs - lastTick < 1000UL) continue;
     lastTick = nowMs;
 
-    // รีเซ็ตแฟล็กเมื่อขึ้นวันใหม่
     int ymd = ymd_local_from_utc(nowUtc());
     if (ymd != lastYmd){
       advisedStandbyA = false;
@@ -1165,14 +1180,12 @@ static void StandbyTask(void*){
       lastYmd = ymd;
     }
 
-    // อ่านค่าปัจจุบัน (จากระบบหลัก)
     const bool Aon = relayA;
     const bool Bon = relayB;
-    const float pA = powerA;      // W
-    const float pB = powerB;      // W
+    const float pA = powerA;
+    const float pB = powerB;
 
-    // --- ช่อง A ---
-    const bool stA = Aon && (pA < 10.0f);   // เงื่อนไขไฟต่ำกว่า 10W
+    const bool stA = Aon && (pA < 10.0f);
     Serial.printf("[Standby] A st=%d pA=%.2fW Aon=%d\n", stA, pA, Aon);
     if (stA) {
       if (!standbyStartA) {
@@ -1183,14 +1196,13 @@ static void StandbyTask(void*){
       if (elapsedA >= STBY_REPEAT_MIN * 60UL * 1000UL) {
         Serial.printf("[Standby] A ครบเวลา %lu ms (~%lu นาที)\n", elapsedA, elapsedA/60000);
         setStandbyAlert("ปลั๊ก A ใช้ไฟต่ำต่อเนื่อง — ควรพิจารณาปิดเพื่อลดการสิ้นเปลือง");
-        standbyStartA = nowMs;  // reset เพื่อให้แจ้งซ้ำตามช่วงเวลา
+        standbyStartA = nowMs;
       }
     } else {
       standbyStartA = 0;
     }
 
-    // --- ช่อง B ---
-    const bool stB = Bon && (pB < 10.0f);   // เงื่อนไขไฟต่ำกว่า 10W
+    const bool stB = Bon && (pB < 10.0f);
     Serial.printf("[Standby] B st=%d pB=%.2fW Bon=%d\n", stB, pB, Bon);
     if (stB) {
       if (!standbyStartB) {
@@ -1201,7 +1213,7 @@ static void StandbyTask(void*){
       if (elapsedB >= STBY_REPEAT_MIN * 60UL * 1000UL) {
         Serial.printf("[Standby] B ครบเวลา %lu ms (~%lu นาที)\n", elapsedB, elapsedB/60000);
         setStandbyAlert("ปลั๊ก B ใช้ไฟต่ำต่อเนื่อง — ควรพิจารณาปิดเพื่อลดการสิ้นเปลือง");
-        standbyStartB = nowMs;  // reset เพื่อให้แจ้งซ้ำตามช่วงเวลา
+        standbyStartB = nowMs;
       }
     } else {
       standbyStartB = 0;
@@ -1209,12 +1221,11 @@ static void StandbyTask(void*){
   }
 }
 
-// สตาร์ท Task อัตโนมัติ โดยไม่ต้องแก้ setup()/loop()
 __attribute__((constructor)) static void _startStandbyTask(){
 #if defined(ESP32)
   xTaskCreatePinnedToCore(StandbyTask, "StandbyTask", 4096, nullptr, 1, nullptr, 1);
 #else
-  // ถ้าไม่ใช่ ESP32 ให้คุณเรียก StandbyTask จาก loop เอง (แต่โปรเจกต์นี้คือ ESP32)
+  // Non-ESP32: call StandbyTask from loop if needed
 #endif
 }
 /**** === End Standby Advisor add-on === ****/
