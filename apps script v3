@@ -1,0 +1,221 @@
+/************* CONFIG *************/
+const DATA_SHEET = 'Data';
+const LOG_SHEET  = 'Log';
+const SUMMARY_SHEET = 'Summary';
+const EXPECTED   = 'Smart_Plug';
+const TZ         = 'Asia/Bangkok';
+
+/************* Web App Entrypoints *************/
+function doPost(e){ return handleReq(e, 'POST'); }
+function doGet(e){  return handleReq(e, 'GET');  }
+
+/************* Main Handler *************/
+function handleReq(e, method){
+  const ss = SpreadsheetApp.getActive();
+  const dataSh = ss.getSheetByName(DATA_SHEET) || ss.insertSheet(DATA_SHEET);
+  const logSh  = ss.getSheetByName(LOG_SHEET)  || ss.insertSheet(LOG_SHEET);
+  const sumSh  = ss.getSheetByName(SUMMARY_SHEET) || ss.insertSheet(SUMMARY_SHEET);
+
+  ensureDataHeader_(dataSh);
+  ensureSummaryHeader_(sumSh);
+
+  // ---- Parse payload ----
+  const safe = e || {};
+  const headers = safe.headers || {};
+  const ct = String(headers['content-type'] || headers['Content-Type'] || (safe.postData && safe.postData.type) || '').toLowerCase();
+  const raw = (safe.postData && safe.postData.contents) || '';
+  let d = {};
+  try {
+    try { d = JSON.parse(raw || '{}'); } catch (_) {}
+    if (!Object.keys(d).length && Object.keys(safe.parameter || {}).length) d = safe.parameter;
+    if (!Object.keys(d).length && raw) d = parsePlain(raw);
+  } catch (err) {
+    logSh.appendRow([new Date(), method, 'parse-error', String(err), raw]);
+    return ContentService.createTextOutput('BAD_PAYLOAD');
+  }
+
+  // ---- Auth (secret) ----
+  const secret = headers['x-secret'] || headers['X-Secret'] || (d.k || d.K) ||
+                 (safe.parameter && (safe.parameter.k || safe.parameter.K)) || '';
+  const ok = EXPECTED ? (secret === EXPECTED) : true;
+
+  logSh.appendRow([new Date(), method, 'ct='+ct, 'secret='+(ok?'ok':'bad'), raw || JSON.stringify(d)]);
+  if (!ok) return ContentService.createTextOutput('FORBIDDEN');
+
+  // ---- Write Data (raw ทุกนาทีตามเดิม) ----
+  const dataRow = [
+    new Date(),           // ts
+    onoff(d.swA), onoff(d.swB),
+    num(d.iIn), num(d.vIn),
+    num(d.vA), num(d.vB),
+    num(d.iA), num(d.iB),
+    num(d.pA), num(d.pB),
+    num(d.tC), num(d.hum),
+    tripText(d.tripA), tripText(d.tripB),
+    num(d.dWh), num(d.wWh),
+    num(d.dWhPrev), num(d.wWhPrev)
+  ];
+  dataSh.appendRow(dataRow);
+  SpreadsheetApp.flush();
+
+  // ---- Summary (ทำเฉพาะช่วง pre-cut/cut) ----
+  appendSummary_ON_CUT_ONLY_(sumSh, d);
+
+  // (optional) บันทึกข้อความสรุปลง Log เวลา ct=summary เพื่อดูย้อนหลัง/ดีบัก
+  if (String(d.ct || '') === 'summary') {
+    logSh.appendRow([new Date(), 'SUMMARY', d.dailySummary || '', d.adviceSummary || '']);
+  }
+
+  return ContentService.createTextOutput('OK');
+}
+
+/************* Summary header *************/
+function ensureSummaryHeader_(sh){
+  // เดิมมี 5 คอลัมน์ → เพิ่มช่องข้อความสรุปด้วย
+  const want = ['ts','dailyWh','dailyWhPrev','weeklyWh','weeklyWhPrev','dailyMsg','advice'];
+  if (sh.getLastRow() === 0){
+    sh.appendRow(want);
+    return;
+  }
+  const header = sh.getRange(1,1,1,sh.getMaxColumns()).getValues()[0].map(x=>String(x||'').trim());
+  if (header.length < want.length){
+    sh.getRange(1, header.length+1, 1, want.length-header.length)
+      .setValues([want.slice(header.length)]);
+  }
+}
+
+/**
+ * เขียน Summary เฉพาะตอน "ก่อนตัด" และ "หลังตัด"
+ * - pre-cut จริง:    dWh > 0  && dWhPrev = 0
+ * - cut (หลังตัด):   dWh ≈ 0  && dWhPrev > 0
+ * - ถ้าได้รับ cut แต่ "วันนี้" ยังไม่มี pre-cut → สร้าง pre-cut แบบ Fallback ให้ก่อน
+ * - วันละไม่เกิน 2 แถว (pre-cut + cut)
+ * - รองรับข้อความจากอุปกรณ์: dailySummary (dailyMsg) และ adviceSummary (advice)
+ */
+function appendSummary_ON_CUT_ONLY_(sh, d){
+  const hasNum   = v => !(v===undefined || v===null || v==='') && !isNaN(Number(v));
+  const nearZero = v => Math.abs(Number(v)||0) < 1e-6;
+
+  const dWh     = Number(d.dWh)||0;
+  const dWhPrev = hasNum(d.dWhPrev)? Number(d.dWhPrev):0;
+  const wWh     = Number(d.wWh)||0;
+  const wWhPrev = hasNum(d.wWhPrev)? Number(d.wWhPrev):0;
+
+  // ข้อความที่ ESP32 ส่งมา (Apps Script จะ decode ให้อัตโนมัติอยู่แล้ว)
+  const dailyMsg = String(d.dailySummary || '');
+  const advice   = String(d.adviceSummary || '');
+
+  const tsDate = Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd');
+
+  // นับจำนวนแถวของ "วันนี้" ใน Summary
+  const lastRow = sh.getLastRow();
+  let todayCount = 0;
+  if (lastRow > 1){
+    const all = sh.getRange(2,1,lastRow-1,sh.getMaxColumns()).getValues();
+    todayCount = all.filter(r => cellToYmd_(r[0]) === tsDate).length;
+  }
+
+  // จัดประเภทแพ็กเกจที่มาถึง
+  const isPreCut = (!nearZero(dWh) && nearZero(dWhPrev));   // ก่อนรีเซ็ต: dWh ยังวิ่ง, dWhPrev=0
+  const isCut    = ( nearZero(dWh) && !nearZero(dWhPrev));  // หลังรีเซ็ต: dWh=0, dWhPrev เก็บของเก่า
+
+  // 1) pre-cut (จริง) → บันทึกก็ต่อเมื่อวันนี้ยังไม่มีแถวเลย
+  if (isPreCut && todayCount < 1){
+    sh.appendRow([tsDate, dWh, dWhPrev, wWh, wWhPrev, '', '']);
+    return;
+  }
+
+  // 2) cut: ถ้าวันนี้ยังไม่มี pre-cut เลย ให้สร้าง pre-cut (fallback) จากข้อมูล cut ก่อน
+  if (isCut){
+    if (todayCount < 1){
+      const preDaily   = dWhPrev;                         // ใช้ค่าก่อนตัดจาก dWhPrev
+      const preDailyPv = 0;                               // ก่อนตัดยังไม่มีของเมื่อวาน
+      const preWeekly  = !nearZero(wWh) ? wWh : dWhPrev;  // ถ้า wWh ไม่มา ใช้ dWhPrev แทน
+      const preWeekPv  = wWhPrev;
+      sh.appendRow([tsDate, preDaily, preDailyPv, preWeekly, preWeekPv, '', '']);
+      todayCount++;
+    }
+    // แล้วจึงบันทึกแถว cut (ถ้ายังไม่ครบ 2 แถว) พร้อมแนบข้อความจากอุปกรณ์
+    if (todayCount < 2){
+      sh.appendRow([tsDate, dWh, dWhPrev, wWh, wWhPrev, dailyMsg, advice]);
+    } else {
+      // กรณีส่งซ้ำ → อัปเดตข้อความในแถว cut ของวันนี้แทนเพิ่มแถว
+      const map = getColMap_(sh, ['ts','dailyMsg','advice']);
+      const row = getSummaryRowIndex_(sh, tsDate, map);
+      if (row){
+        if (map.dailyMsg) sh.getRange(row, map.dailyMsg).setValue(dailyMsg);
+        if (map.advice)   sh.getRange(row, map.advice).setValue(advice);
+      }
+    }
+    return;
+  }
+
+  // อย่างอื่นไม่บันทึก (แพ็กเกจปกติที่ยิงทุก ๆ นาที)
+}
+
+/************* Data header *************/
+function ensureDataHeader_(sh){
+  if (sh.getLastRow() === 0){
+    sh.appendRow([
+      'ts','swA','swB','iIn','vIn','vA','vB','iA','iB','pA','pB',
+      'tC','hum','tripA','tripB','dailyWh','weeklyWh','dailyWhPrev','weeklyWhPrev'
+    ]);
+  }
+}
+
+/************* Helpers *************/
+function num(x){ return (x === '' || x === null || x === undefined) ? '' : Number(x); }
+function isTrue(v){ return v===true || v===1 || v==='1' || String(v).toLowerCase()==='true' || v==='เปิด' || v==='ตัดแล้ว'; }
+function onoff(v){ return isTrue(v) ? 'เปิด' : 'ปิด'; }
+function tripText(v){ return isTrue(v) ? 'ตัดแล้ว' : 'ปกติ'; }
+
+function parsePlain(raw){
+  const res={};
+  const parts = raw.split(/[,|]/).map(s=>s.trim());
+  if (parts.length >= 18){
+    [res.swA,res.swB,res.iIn,res.vIn,res.vA,res.vB,res.iA,res.iB,res.pA,res.pB,res.tC,res.hum,res.tripA,res.tripB,
+     res.dWh,res.wWh,res.dWhPrev,res.wWhPrev] = parts;
+    return res;
+  }
+  raw.split(/[\n&]+/).forEach(pair=>{
+    const [k,...rest]=pair.split('=');
+    if (k) res[k.trim()] = (rest.join('=')||'').trim();
+  });
+  return res;
+}
+
+/************* Column/row helpers *************/
+function getColMap_(sh, keys){
+  const header = sh.getRange(1,1,1,sh.getMaxColumns()).getValues()[0];
+  const map = {};
+  for (let c=1;c<=header.length;c++){
+    const name = String(header[c-1]||'').trim();
+    if (!name) continue;
+    keys.forEach(k=>{ if (name===k && !map[k]) map[k]=c; });
+  }
+  return map;
+}
+function cellToYmd_(v){
+  if (v instanceof Date) return Utilities.formatDate(v, TZ, 'yyyy-MM-dd');
+  const s = String(v||'').trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const d = new Date(s); if (!isNaN(d.getTime())) return Utilities.formatDate(d, TZ, 'yyyy-MM-dd');
+  return s;
+}
+function getSummaryRowIndex_(sh, ymd, map){
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return 0;
+
+  const candidateCols = [];
+  if (map.ts) candidateCols.push(map.ts);
+  if (!candidateCols.includes(1)) candidateCols.push(1);
+
+  for (const col of candidateCols){
+    const rng = sh.getRange(2, col, lastRow-1, 1);
+    const vals = rng.getValues();
+    for (let i=0;i<vals.length;i++){
+      if (cellToYmd_(vals[i][0]) === ymd) return 2 + i;
+    }
+  }
+  return 0;
+}
