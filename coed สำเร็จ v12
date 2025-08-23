@@ -1,6 +1,7 @@
 // ==== Arduino Cloud Smart Plug (Full, Weekly Sticky + Clean Standby) ====
 // - Weekly summary: alert sticky 2 min + send to Google Sheet (ct=weekly + fallback param)
-// - Standby alert text simplified; removed time/seq suffix
+// - Weekly alert แยกจาก "ความปลอดภัย" (ไม่แตะ ocAlert)
+// - Standby/Safety ล้าง tail ดีบัก (@22:52 #17) อัตโนมัติ
 // - Persist NVS + 7-day history etc. (as before)
 
 #include "thingProperties.h"
@@ -24,8 +25,8 @@ static bool tripA_flag = false;
 static bool tripB_flag = false;
 
 /* ==== Reset Time Config ==== */
-const int RESET_HOUR = 20;   // 00-23
-const int RESET_MIN  = 36;    // 00-59
+const int RESET_HOUR = 00;   // 00-23
+const int RESET_MIN  = 00;   // 00-59
 #define STBY_REPEAT_MIN 60   // Standby repeat minutes
 
 // Weekly cutoff (0=Sun..6=Sat)
@@ -141,20 +142,36 @@ unsigned long g_alertLockUntilMs = 0;
 inline void pushReply(const String& s){ msgReply=s; Serial.println("[Reply] "+s);
   g_echoing=true; msgCommand=s; ArduinoCloud.update(); g_echoing=false; }
 
-/* ---- Alerts ---- */
+/* ---- Helpers: ล้าง tail ดีบัก และ Sticky สำหรับ "แจ้งเตือนทั่วไป" (ไม่ใช่ความปลอดภัย) ---- */
+String stripDebugTail(String s){
+  int p = s.indexOf('@');
+  if (p >= 0) { s = s.substring(0, p); s.trim(); }
+  return s;
+}
+void setInfoMessageSticky(const String& s, unsigned long sticky_ms){
+  String t = stripDebugTail(s);
+  msgReply = t;                 // ไม่แตะ ocAlert => ไม่เข้า "แจ้งเตือนความปลอดภัย"
+  needImmediatePost = true;
+  g_alertLockUntilMs = millis() + sticky_ms;
+  Serial.println("[Info*STICKY] " + t);
+}
+
+/* ---- Alerts (ความปลอดภัยเท่านั้น) ---- */
 void setAlertMessage(const String& s){
   static String last;
   if (millis() < g_alertLockUntilMs) return;  // still locked
-  if (s != last){
-    msgReply = s; ocAlert  = s;
-    Serial.println("[Alert] " + s);
-    last = s;
+  String t = stripDebugTail(s);
+  if (t != last){
+    msgReply = t; ocAlert  = t;               // << หมวดความปลอดภัย
+    Serial.println("[Alert] " + t);
+    last = t;
     needImmediatePost = true;
   }
 }
 void setAlertMessageSticky(const String& s, unsigned long sticky_ms){
-  msgReply = s; ocAlert = s;
-  Serial.println("[Alert*STICKY] " + s);
+  String t = stripDebugTail(s);
+  msgReply = t; ocAlert = t;                   // << หมวดความปลอดภัย
+  Serial.println("[Alert*STICKY] " + t);
   needImmediatePost = true;
   g_alertLockUntilMs = millis() + sticky_ms;
 }
@@ -439,7 +456,7 @@ static inline int makeYmdHM(DateTime loc){
   return loc.year()*100000000 + loc.month()*1000000 + loc.day()*10000 + loc.hour()*100 + loc.minute();
 }
 
-/* ==== Weekly summary (with sticky alert) ==== */
+/* ==== Weekly summary (with sticky alert, non-safety) ==== */
 void sendWeeklySummary(bool doRollover){
   float thisW = (float)round2(g_weeklyWh);
   float lastW = (float)round2(g_weeklyWhPrev);
@@ -458,8 +475,8 @@ void sendWeeklySummary(bool doRollover){
   g_justWeeklyReset = true;
   needImmediatePost = true;
 
-  // Sticky 2 minutes
-  setAlertMessageSticky(ws, 120000UL);
+  // Sticky 2 minutes — แจ้งเตือนทั่วไป (ไม่ใช่ความปลอดภัย)
+  setInfoMessageSticky(ws, 120000UL);
 
   if (doRollover) {
     g_weeklyWhPrev = g_weeklyWh;
@@ -1195,14 +1212,15 @@ void onResetWeeklyChange() {
 #include "freertos/task.h"
 #endif
 
-// ข้อความแจ้งเตือนสแตนด์บาย (ไม่มีเวลาหรือ #seq ต่อท้าย)
+// ข้อความแจ้งเตือนสแตนด์บาย (ไม่มีเวลาหรือ #seq ต่อท้าย + ล้าง tail)
 void setStandbyAlert(const String& s){
-  standbyAlert = s;
-  msgReply     = s;
+  String t = stripDebugTail(s);
+  standbyAlert = t;
+  msgReply     = t;
   needImmediatePost = true;
   ArduinoCloud.update();
-  Serial.println("[Standby] " + s);
-  addAdvice(s);
+  Serial.println("[Standby] " + t);
+  addAdvice(t);
 }
 
 static bool advisedStandbyA = false, advisedStandbyB = false;
