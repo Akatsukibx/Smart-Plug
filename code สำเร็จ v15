@@ -134,6 +134,9 @@ volatile bool g_echoing=false;
 /* ===== Alert sticky lock ===== */
 unsigned long g_alertLockUntilMs = 0;
 
+inline void pushReply(const String& s){ msgReply=s; Serial.println("[Reply] "+s);
+  g_echoing=true; msgCommand=s; ArduinoCloud.update(); g_echoing=false; }
+
 /* ---- Helpers: ล้าง tail ดีบัก และ Sticky สำหรับ "แจ้งเตือนทั่วไป" (ไม่ใช่ความปลอดภัย) ---- */
 String stripDebugTail(String s){
   int p = s.indexOf('@');
@@ -310,26 +313,13 @@ bool isAny(const String& token,const char* a,const char* b,const char* c){
   return false;
 }
 String join(const char* a[],int n){ String s; for(int i=0;i<n;i++){ if(i) s+=" | "; s+=a[i]; } return s; }
-
-/* ====== UPDATED: showSuggestions ====== */
 void showSuggestions(char which){
-  if (which=='?'){
-    pushReply(
-      "Try: A ... | B ... | All ... | help\n"
-      "ตัวอย่าง: A เปิด 2 ชั่วโมง 30 นาที, B ปิด 30 นาที, All on at 21:30"
-    );
-    return;
-  }
-  const char* th[]={"เปิด [เวลา]","ปิด [เวลา]","ยกเลิก"};
-  const char* en[]={"on [time]","off [time]","cancel"};
+  if(which=='?'){ const char* root[]={"A ...","B ...","All ...","help"};
+    pushReply("Try: "+join(root,4)+"\nตัวอย่าง: A เปิด 2 ชั่วโมง 30 นาที, B ปิด 30 นาที, All on at 21:30"); return; }
+  const char* th[]={"เปิด [เวลา]","ปิด [เวลา]","ยกเลิก"}; const char* en[]={"on [time]","off [time]","cancel"};
   String head=(which=='A')?"A":(which=='B')?"B":"All";
-  pushReply(
-    head+" → "+join(th,3)+
-    "\nEN: "+head+" "+join(en,3)+
-    "\n[เวลา]= 30 นาที | 1 ชั่วโมง | 2 ชั่วโมง 30 นาที | at 21:30"
-  );
+  pushReply(head+" → "+join(th,3)+"\nEN: "+head+" "+join(en,3)+"\n[เวลา]= 30 นาที | 1 ชั่วโมง | 2 ชั่วโมง 30 นาที | at 21:30");
 }
-
 int extractFirstInt(const String& s){ String d=""; for(size_t i=0;i<s.length();++i){ char c=s[i]; if(c>='0'&&c<='9') d+=c; else if(d.length()) break; } return d.length()? d.toInt():-1; }
 bool hasHourUnit(String s){
   String u=toUpperAscii(s);
@@ -383,24 +373,99 @@ uint32_t parseLocalHHMM_toUTC(const String& tail){
 /* ===== Actions / status ===== */
 String whoStr(char w){ return String((w=='X')?"ALL":(w=='A'?"A":"B")); }
 String actFutureTH(bool on){ return String(on? "จะเปิด":"จะปิด"); }
-void scheduleAction(char which,bool turnOn,int minutes){
-  minutes=clampMinutes(minutes); uint32_t when=nowUtc() + (uint32_t)minutes*60UL;
-  if(which=='A'||which=='X'){ if(turnOn) A_onAt_s=(minutes==0)? nowUtc():when; else A_offAt_s=(minutes==0)? nowUtc():when; }
-  if(which=='B'||which=='X'){ if(turnOn) B_onAt_s=(minutes==0)? nowUtc():when; else B_offAt_s=(minutes==0)? nowUtc():when; }
-  if(which=='A') showNextA=(minutes>0);
-  else if(which=='B') showNextB=(minutes>0);
-  else if(which=='X'){ showNextAll=(minutes>0); showNextA=showNextB=false; showOnlyAll=true; }
+
+/* ==== ▼▼▼ เพิ่ม/แทนที่ส่วนตั้งเวลาให้ตรงที่นี่ ▼▼▼ ==== */
+// === NEW helper: ตอบว่าอยู่แล้ว ===
+void replyAlready(char which, bool turnOn){
+  String label = (which=='X') ? "ALL" : (which=='A' ? "A" : "B");
+  String already = turnOn ? "เปิดอยู่แล้ว" : "ปิดอยู่แล้ว";
+
+  if (which == 'X') {
+    // สรุปแบบรวม
+    if (relayA == turnOn && relayB == turnOn) {
+      pushReply("ALL → " + already + " (A+B)");
+    } else if (relayA == turnOn && relayB != turnOn) {
+      pushReply("A → " + already + " | ตั้งเวลาให้เฉพาะ B");
+    } else if (relayB == turnOn && relayA != turnOn) {
+      pushReply("B → " + already + " | ตั้งเวลาให้เฉพาะ A");
+    } else {
+      // ทั้งคู่ยังไม่เป็นไปตามที่สั่ง -> ไม่ตอบอยู่แล้วที่นี่
+    }
+  } else {
+    pushReply(label + " → " + already);
+  }
+}
+
+// === REPLACE: scheduleAction(char which,bool turnOn,int minutes) ===
+void scheduleAction(char which, bool turnOn, int minutes){
+  minutes = clampMinutes(minutes);
+
+  // ถ้าทั้งหมด "อยู่แล้ว" และเป็นคำสั่งตั้งเวลา -> ตอบและไม่ตั้งเวลา
+  if (which == 'A' && (relayA == turnOn) && minutes > 0) { replyAlready('A', turnOn); return; }
+  if (which == 'B' && (relayB == turnOn) && minutes > 0) { replyAlready('B', turnOn); return; }
+  if (which == 'X' && (relayA == turnOn) && (relayB == turnOn) && minutes > 0) {
+    replyAlready('X', turnOn); return;
+  }
+
+  // ตั้งเวลาเฉพาะช่องที่ยัง "ไม่อยู่" ในสถานะเป้าหมาย
+  uint32_t when = nowUtc() + (uint32_t)minutes * 60UL;
+
+  if (which=='A' || which=='X') {
+    if (relayA != turnOn || minutes == 0) {
+      if (turnOn) A_onAt_s  = (minutes==0) ? nowUtc() : when;
+      else        A_offAt_s = (minutes==0) ? nowUtc() : when;
+    }
+  }
+  if (which=='B' || which=='X') {
+    if (relayB != turnOn || minutes == 0) {
+      if (turnOn) B_onAt_s  = (minutes==0) ? nowUtc() : when;
+      else        B_offAt_s = (minutes==0) ? nowUtc() : when;
+    }
+  }
+
+  if (which=='A')      showNextA   = (minutes > 0);
+  else if (which=='B') showNextB   = (minutes > 0);
+  else if (which=='X'){ showNextAll = (minutes > 0); showNextA = showNextB = false; showOnlyAll=true; }
+
   saveTimers();
-  pushReply(whoStr(which)+" "+actFutureTH(turnOn)+" "+(minutes? formatWhenRelativeUTC(when):"เดี๋ยวนี้"));
+
+  // ข้อความตอบกลับ
+  if (minutes == 0) {
+    pushReply(whoStr(which) + " " + actFutureTH(turnOn) + " เดี๋ยวนี้");
+  } else {
+    pushReply(whoStr(which) + " " + actFutureTH(turnOn) + " " + formatWhenRelativeUTC(when));
+  }
 }
-void scheduleActionAt(char which,bool turnOn,uint32_t when){
-  if(which=='A'||which=='X'){ if(turnOn) A_onAt_s=when; else A_offAt_s=when; }
-  if(which=='B'||which=='X'){ if(turnOn) B_onAt_s=when; else B_offAt_s=when; }
-  if(which=='A') showNextA=(when>nowUtc());
-  else if(which=='B') showNextB=(when>nowUtc());
-  else if(which=='X'){ showNextAll=(when>nowUtc()); showNextA=showNextB=false; showOnlyAll=true; }
-  saveTimers(); pushReply(whoStr(which)+" "+actFutureTH(turnOn)+" "+formatWhenRelativeUTC(when));
+
+// === REPLACE: scheduleActionAt(char which,bool turnOn,uint32_t when) ===
+void scheduleActionAt(char which, bool turnOn, uint32_t when){
+  // ถ้าทั้งหมด "อยู่แล้ว" และเป็นคำสั่งตั้งเวลา -> ตอบและไม่ตั้งเวลา
+  if (which == 'A' && (relayA == turnOn) && when > nowUtc()) { replyAlready('A', turnOn); return; }
+  if (which == 'B' && (relayB == turnOn) && when > nowUtc()) { replyAlready('B', turnOn); return; }
+  if (which == 'X' && (relayA == turnOn) && (relayB == turnOn) && when > nowUtc()) {
+    replyAlready('X', turnOn); return;
+  }
+
+  // ตั้งเวลาเฉพาะช่องที่ยัง "ไม่อยู่" ในสถานะเป้าหมาย
+  if (which=='A' || which=='X') {
+    if (relayA != turnOn) {
+      if (turnOn) A_onAt_s = when; else A_offAt_s = when;
+    }
+  }
+  if (which=='B' || which=='X') {
+    if (relayB != turnOn) {
+      if (turnOn) B_onAt_s = when; else B_offAt_s = when;
+    }
+  }
+
+  if (which=='A')      showNextA   = (when > nowUtc());
+  else if (which=='B') showNextB   = (when > nowUtc());
+  else if (which=='X'){ showNextAll = (when > nowUtc()); showNextA = showNextB = false; showOnlyAll=true; }
+
+  saveTimers();
+  pushReply(whoStr(which) + " " + actFutureTH(turnOn) + " " + formatWhenRelativeUTC(when));
 }
+/* ==== ▲▲▲ จบส่วนที่เพิ่ม/แทนที่ ▲▲▲ ==== */
 
 /* ===== Status text ===== */
 String relStr(uint32_t when){ if(!when) return ""; return formatWhenRelativeUTC(when); }
@@ -780,15 +845,9 @@ const float CH_FLOATING_MAX_ON  =  60.0f;
 const float CH_FLOATING_EXIT    =  80.0f;
 const unsigned long SUB_IN_DELAY_MS = 1000;
 
-bool useAllForA=false, useAllForB=false;
-unsigned long useAllA_since=0, useAllB_since=0;
-
-/* ====== UPDATED: pushReply (no echo msgCommand) ====== */
-inline void pushReply(const String& s){
-  msgReply = s;
-  Serial.println("[Reply] " + s);
-  ArduinoCloud.update();
-}
+bool useAllForA = false;   // << ต้องเพิ่ม
+bool useAllForB = false;   // << ต้องเพิ่ม
+unsigned long useAllA_since = 0, useAllB_since = 0; // ของเดิมใช้ต่อได้
 
 void loop(){
   ArduinoCloud.update();
@@ -869,10 +928,11 @@ void loop(){
       if (sq > 0) normA_eff = sqrtf(sq);
     }
     if (normB_meas > iB_base_norm + BASE_MARGIN){
+      // แก้สูตรเป็นใช้ iB_base_norm กับ iB_base_norm (ถูกแล้ว)
       float sq = normB_meas*normB_meas - iB_base_norm*iB_base_norm;
       if (sq > 0) normB_eff = sqrtf(sq);
     }
-
+    
     float IrmsA = normA_eff * I_SCALE_A;
     float IrmsB = normB_eff * I_SCALE_B;
 
@@ -897,24 +957,42 @@ void loop(){
       }
     }else capSinceB=0;
 
-    bool Aon = relayA;
-    bool Bon = relayB;
+   bool Aon = relayA;
+   bool Bon = relayB;
 
     if (Aon){
       if (!useAllForA){
-        if (VrmsA < CH_FLOATING_MAX_ON && VrmsALL > MAINS_VALID_MIN){ useAllForA = true; useAllA_since = nowMs; }
+        if (VrmsA < CH_FLOATING_MAX_ON && VrmsALL > MAINS_VALID_MIN){
+          useAllForA = true; 
+          useAllA_since = nowMs;
+        }
       }else{
-        if (VrmsA > CH_FLOATING_EXIT){ useAllForA = false; useAllA_since = 0; }
+        if (VrmsA > CH_FLOATING_EXIT){
+          useAllForA = false; 
+          useAllA_since = 0;
+        }
       }
-    }else{ useAllForA=false; useAllA_since=0; }
+    }else{
+      useAllForA=false; 
+      useAllA_since=0;
+    }
 
     if (Bon){
       if (!useAllForB){
-        if (VrmsB < CH_FLOATING_MAX_ON && VrmsALL > MAINS_VALID_MIN){ useAllForB = true; useAllB_since = nowMs; }
+        if (VrmsB < CH_FLOATING_MAX_ON && VrmsALL > MAINS_VALID_MIN){
+          useAllForB = true; 
+          useAllB_since = nowMs;
+        }
       }else{
-        if (VrmsB > CH_FLOATING_EXIT){ useAllForB = false; useAllB_since = 0; }
+        if (VrmsB > CH_FLOATING_EXIT){
+          useAllForB = false; 
+          useAllB_since = 0;
+        }
       }
-    }else{ useAllForB=false; useAllB_since=0; }
+    }else{
+      useAllForB=false; 
+      useAllB_since=0;
+    }
 
     bool onlyAon = (Aon && !Bon);
     bool onlyBon = (Bon && !Aon);
@@ -1151,20 +1229,59 @@ void cancelTimers(char which){
 
 void onStandbyAlertChange() { /* no-op */ }
 
-/* ====== UPDATED: onMsgCommandChange (เพิ่ม ignore suggestion) ====== */
 void onMsgCommandChange(){
   if (g_echoing) { Serial.println("[CB] echo skip"); return; }
   String raw = msgCommand;
   Serial.println(String("[CB] onMsgCommandChange raw='")+raw+"' len="+raw.length());
 
-  // --- NEW: เมินข้อความแนะแนว/ตัวอย่าง เพื่อไม่ให้วนลูปรันคำสั่งเอง ---
-  if (raw.indexOf("Try:") >= 0 || raw.indexOf("ตัวอย่าง") >= 0 || raw.indexOf("→") >= 0) {
-    Serial.println("[CB] ignore suggestion-like text");
+  String all = normalizeSpaces(raw);
+  if (all.length()==0){ showSuggestions('?'); return; }
+
+  // ====== NEW: Idempotent direct commands (A/B/ALL ON|OFF) ======
+  String u = toUpperAscii(all);
+
+  // A
+  if (u == "A ON" || all == "A เปิด") {
+    if (relayA) pushReply("A → เปิดอยู่แล้ว");
+    else { relayA = true; onRelayAChange(); pushReply("A → เปิดแล้ว"); }
+    return;
+  }
+  if (u == "A OFF" || all == "A ปิด") {
+    if (!relayA) pushReply("A → ปิดอยู่แล้ว");
+    else { relayA = false; onRelayAChange(); pushReply("A → ปิดแล้ว"); }
     return;
   }
 
-  String all = normalizeSpaces(raw);
-  if (all.length()==0){ showSuggestions('?'); return; }
+  // B
+  if (u == "B ON" || all == "B เปิด") {
+    if (relayB) pushReply("B → เปิดอยู่แล้ว");
+    else { relayB = true; onRelayBChange(); pushReply("B → เปิดแล้ว"); }
+    return;
+  }
+  if (u == "B OFF" || all == "B ปิด") {
+    if (!relayB) pushReply("B → ปิดอยู่แล้ว");
+    else { relayB = false; onRelayBChange(); pushReply("B → ปิดแล้ว"); }
+    return;
+  }
+
+  // ALL
+  if (u == "ALL ON" || all == "ALL เปิด") {
+    bool changed=false;
+    if (!relayA){ relayA=true; onRelayAChange(); changed=true; }
+    if (!relayB){ relayB=true; onRelayBChange(); changed=true; }
+    if (changed) pushReply("ALL → เปิดแล้ว (A+B)");
+    else         pushReply("ALL → เปิดอยู่แล้ว (A+B)");
+    return;
+  }
+  if (u == "ALL OFF" || all == "ALL ปิด") {
+    bool changed=false;
+    if (relayA){ relayA=false; onRelayAChange(); changed=true; }
+    if (relayB){ relayB=false; onRelayBChange(); changed=true; }
+    if (changed) pushReply("ALL → ปิดแล้ว (A+B)");
+    else         pushReply("ALL → ปิดอยู่แล้ว (A+B)");
+    return;
+  }
+  // ====== END NEW ======
 
   if (isAny(all, "CANCEL", "ยกเลิก", nullptr)) {
     cancelTimers('X');
@@ -1203,10 +1320,6 @@ void onMsgCommandChange(){
     return;
   }
 
-  if (toUpperAscii(all)=="A ON")  { relayA=true;  onRelayAChange(); pushReply("A → เปิดเดี๋ยวนี้"); return; }
-  if (toUpperAscii(all)=="A OFF") { relayA=false; onRelayAChange(); pushReply("A → ปิดเดี๋ยวนี้"); return; }
-  if (toUpperAscii(all)=="B ON")  { relayB=true;  onRelayBChange(); pushReply("B → เปิดเดี๋ยวนี้"); return; }
-  if (toUpperAscii(all)=="B OFF") { relayB=false; onRelayBChange(); pushReply("B → ปิดเดี๋ยวนี้"); return; }
   if (toUpperAscii(all)=="HELP" || all=="?"){ showSuggestions('?'); return; }
 
   int start=0; bool anyOK=false;
