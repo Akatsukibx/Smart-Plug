@@ -1,0 +1,325 @@
+/************* CONFIG *************/
+const DATA_SHEET    = 'Data';
+const LOG_SHEET     = 'Log';
+const SUMMARY_SHEET = 'Summary';
+const EXPECTED      = 'Smart_Plug';
+const TZ            = 'Asia/Bangkok';
+
+/************* Web App Entrypoints *************/
+function doPost(e){ return handleReq(e, 'POST'); }
+function doGet(e){  return handleReq(e, 'GET');  }
+
+/************* Main Handler *************/
+function handleReq(e, method){
+  const ss = SpreadsheetApp.getActive();
+  const dataSh = ss.getSheetByName(DATA_SHEET)    || ss.insertSheet(DATA_SHEET);
+  const logSh  = ss.getSheetByName(LOG_SHEET)     || ss.insertSheet(LOG_SHEET);
+  const sumSh  = ss.getSheetByName(SUMMARY_SHEET) || ss.insertSheet(SUMMARY_SHEET);
+
+  ensureDataHeader_(dataSh);
+  ensureSummaryHeader_(sumSh);
+  ensureLogHeader_(logSh);
+
+  // ---- Parse payload ----
+  const safe = e || {};
+  const headers = safe.headers || {};
+  const ct  = String(headers['content-type'] || headers['Content-Type'] || (safe.postData && safe.postData.type) || '').toLowerCase();
+  const raw = (safe.postData && safe.postData.contents) || '';
+  let d = {};
+  try {
+    try { d = JSON.parse(raw || '{}'); } catch (_) {}
+    if (!Object.keys(d).length && Object.keys(safe.parameter || {}).length) d = safe.parameter;
+    if (!Object.keys(d).length && raw) d = parsePlain(raw);
+  } catch (err) {
+    logSh.appendRow([new Date(), method, 'parse-error', String(err), raw]);
+    return ContentService.createTextOutput('BAD_PAYLOAD');
+  }
+
+  // ---- Auth (secret) ----
+  const secret = headers['x-secret'] || headers['X-Secret'] || (d.k || d.K) ||
+                 (safe.parameter && (safe.parameter.k || safe.parameter.K)) || '';
+  const ok = EXPECTED ? (secret === EXPECTED) : true;
+
+  logSh.appendRow([new Date(), method, 'ct='+ct, 'secret='+(ok?'ok':'bad'), raw || JSON.stringify(d)]);
+  if (!ok) return ContentService.createTextOutput('FORBIDDEN');
+
+  // ---- PULL LATEST STATE ----
+  const ctParam = String((d.ct || (safe.parameter && safe.parameter.ct) || '')).trim().toLowerCase();
+  if (ctParam === 'pull_state' || ctParam === 'last') {
+    const latest = latestFromData_(dataSh);
+    return ContentService
+      .createTextOutput(JSON.stringify(latest || { ok:false, reason:'NO_DATA' }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // ---- Write Data (live ทุกนาที) ----
+  const dataRow = [
+    new Date(),           // ts
+    onoff(d.swA), onoff(d.swB),
+    num(d.iIn), num(d.vIn),
+    num(d.vA), num(d.vB),
+    num(d.iA), num(d.iB),
+    num(d.pA), num(d.pB),
+    num(d.tC), num(d.hum),
+    tripText(d.tripA), tripText(d.tripB),
+
+    // === ENERGY MAPPING TO SHEET "Data" (columns P..U) ===
+    // index (0-based): 15..20
+    num(d.dWh),        // 15 → P  dailyWh
+    num(d.wWh),        // 16 → Q  weeklyWh
+    num(d.dWhPrev),    // 17 → R  dailyWhPrev
+    num(d.wWhPrev),    // 18 → S  weeklyWhPrev
+    num(d.mWh),        // 19 → T  monthWh
+    num(d.mWhPrev)     // 20 → U  monthWhPrev
+  ];
+  dataSh.appendRow(dataRow);
+  SpreadsheetApp.flush();
+
+  // ---- Summary: บันทึก “เฉพาะตอนตัดรอบ” วันละ 1 แถว ----
+  appendSummary_ON_CUT_ONLY_(sumSh, d);
+
+  // (optional) log ข้อความจากอุปกรณ์ตามประเภทสรุป
+  if (String(d.ct || '') === 'summary') {
+    logSh.appendRow([new Date(), 'SUMMARY', d.dailySummary || '', d.adviceSummary || '']);
+  }
+  if (String(d.ct || '') === 'monthly') {
+    logSh.appendRow([new Date(), 'MONTHLY', d.monthlySummary || '', '']);
+  }
+  // fallbacks
+  if (String(d.weeklySummary_any || '')) {
+    logSh.appendRow([new Date(), 'WEEKLY_ANY', d.weeklySummary_any, '']);
+  }
+  if (String(d.monthlySummary_any || '')) {
+    logSh.appendRow([new Date(), 'MONTHLY_ANY', d.monthlySummary_any, '']);
+  }
+
+  return ContentService.createTextOutput('OK');
+}
+
+/************* Data header (ต้องสอดคล้องกับ latestFromData_) *************/
+function ensureDataHeader_(sh){
+  if (sh.getLastRow() === 0){
+    sh.appendRow([
+      'ts','swA','swB','iIn','vIn','vA','vB','iA','iB','pA','pB',
+      'tC','hum','tripA','tripB',
+      // P..U
+      'dailyWh','weeklyWh','dailyWhPrev','weeklyWhPrev','monthWh','monthWhPrev'
+    ]);
+  } else {
+    // เติมหัวคอลัมน์ใหม่ หากไฟล์เก่ายังไม่มีคอลัมน์
+    const want = [
+      'ts','swA','swB','iIn','vIn','vA','vB','iA','iB','pA','pB',
+      'tC','hum','tripA','tripB',
+      'dailyWh','weeklyWh','dailyWhPrev','weeklyWhPrev','monthWh','monthWhPrev'
+    ];
+    const header = sh.getRange(1,1,1,sh.getMaxColumns()).getValues()[0].map(x=>String(x||'').trim());
+    if (header.length < want.length){
+      sh.getRange(1, header.length+1, 1, want.length-header.length)
+        .setValues([want.slice(header.length)]);
+    }
+  }
+}
+
+/************* Summary header (คอลัมน์ tips สำหรับข้อความ) *************/
+function ensureSummaryHeader_(sh){
+  const want = ['ts','dailyWh','dailyWhPrev','weeklyWh','weeklyWhPrev','monthWh','monthWhPrev','tips'];
+  if (sh.getLastRow() === 0){
+    sh.appendRow(want);
+    return;
+  }
+  const header = sh.getRange(1,1,1,sh.getMaxColumns()).getValues()[0].map(x=>String(x||'').trim());
+  if (header.length < want.length){
+    sh.getRange(1, header.length+1, 1, want.length-header.length)
+      .setValues([want.slice(header.length)]);
+  }
+}
+
+/************* Log header *************/
+function ensureLogHeader_(sh){
+  if (sh.getLastRow() === 0){
+    sh.appendRow(['ts','method','tag','info']);
+  }
+}
+
+/**
+ * เขียน Summary “เฉพาะตอนตัดรอบ”
+ * - cut (หลังตัด): dWh ≈ 0 && dWhPrev > 0
+ * - วันละแถวเดียว: ถ้ามีแถวของวันนี้อยู่แล้ว → อัปเดตค่า/ข้อความแทน
+ * - ค่าโชว์: ใช้ dWhPrev/wWhPrev/mWhPrev เป็นค่า effective เพื่อไม่ให้เป็น 0
+ */
+function appendSummary_ON_CUT_ONLY_(sh, d){
+  const nearZero = v => Math.abs(Number(v)||0) < 1e-6;
+
+  const dWh      = Number(d.dWh)||0;
+  const dWhPrev  = Number(d.dWhPrev||0);
+  const wWh      = Number(d.wWh)||0;
+  const wWhPrev  = Number(d.wWhPrev)||0;
+  const mWh      = Number(d.mWh||0);
+  const mWhPrev  = Number(d.mWhPrev||0);
+
+  const isCut = ( nearZero(dWh) && !nearZero(dWhPrev) );
+  if (!isCut) return;
+
+  const dailyEff   = dWhPrev;
+  const weeklyEff  = !nearZero(wWh) ? wWh : ( !nearZero(wWhPrev) ? wWhPrev : dWhPrev );
+  const monthlyEff = !nearZero(mWh) ? mWh : ( !nearZero(mWhPrev) ? mWhPrev : 0 );
+
+  const dailyMsg = String(d.dailySummary || '').trim();
+  const advice   = String(d.adviceSummary || '').trim();
+  const monthlyMsg = String(d.monthlySummary || d.monthlySummary_any || '').trim();
+
+  let tipsText = dailyMsg;
+  if (advice) tipsText = tipsText ? (tipsText + ' | แนะนำ: ' + advice) : ('แนะนำ: ' + advice);
+  if (monthlyMsg) tipsText = tipsText ? (tipsText + ' | ' + monthlyMsg) : monthlyMsg;
+
+  const ymd = Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd');
+
+  // ถ้ามีแถวของวันนี้อยู่แล้ว → อัปเดต
+  const lastRow = sh.getLastRow();
+  if (lastRow > 1){
+    const rows = sh.getRange(2,1,lastRow-1,1).getValues();
+    for (let i=0;i<rows.length;i++){
+      const cell = rows[i][0];
+      const cellYmd = (cell instanceof Date) ? Utilities.formatDate(cell, TZ, 'yyyy-MM-dd') : String(cell||'').trim();
+      if (cellYmd === ymd){
+        sh.getRange(i+2, 2, 1, 6).setValues([[dailyEff, dWhPrev, weeklyEff, wWhPrev, monthlyEff, mWhPrev]]);
+        sh.getRange(i+2, 8).setValue(tipsText); // tips at col 8
+        return;
+      }
+    }
+  }
+
+  // ยังไม่มีแถวของวันนี้ → สร้างใหม่
+  sh.appendRow([ymd, dailyEff, dWhPrev, weeklyEff, wWhPrev, monthlyEff, mWhPrev, tipsText]);
+}
+
+/************* Helpers *************/
+function num(x){ return (x === '' || x === null || x === undefined) ? '' : Number(x); }
+function isTrue(v){ return v===true || v===1 || v==='1' || String(v).toLowerCase()==='true' || v==='เปิด' || v==='ตัดแล้ว'; }
+function onoff(v){ return isTrue(v) ? 'เปิด' : 'ปิด'; }
+function tripText(v){ return isTrue(v) ? 'ตัดแล้ว' : 'ปกติ'; }
+
+// ✅ parser: urlencoded/kv หรือ CSV 'a,b,c'
+function parsePlain(raw){
+  const res = {};
+  const parts = raw.split(/[,|]/).map(s => s.trim());
+  if (parts.length >= 20){ // ตามลำดับใหม่
+    [res.swA,res.swB,res.iIn,res.vIn,res.vA,res.vB,res.iA,res.iB,res.pA,res.pB,res.tC,res.hum,res.tripA,res.tripB,
+     res.dWh,res.wWh,res.dWhPrev,res.wWhPrev,res.mWh,res.mWhPrev] = parts;
+    return res;
+  }
+  raw.split(/[\n&]+/).forEach(seg=>{
+    if (!seg) return;
+    const i = seg.indexOf('=');
+    if (i >= 0){
+      const k = seg.slice(0,i).trim();
+      const v = seg.slice(i+1).trim();
+      if (k) res[k] = v;
+    } else {
+      const k = seg.trim();
+      if (k) res[k] = '';
+    }
+  });
+  return res;
+}
+
+/************* (optional) Column/row helpers *************/
+function getColMap_(sh, keys){
+  const header = sh.getRange(1,1,1,sh.getMaxColumns()).getValues()[0];
+  const map = {};
+  for (let c=1;c<=header.length;c++){
+    const name = String(header[c-1]||'').trim();
+    if (!name) continue;
+    keys.forEach(k=>{ if (name===k && !map[k]) map[k]=c; });
+  }
+  return map;
+}
+function cellToYmd_(v){
+  if (v instanceof Date) return Utilities.formatDate(v, TZ, 'yyyy-MM-dd');
+  const s = String(v||'').trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const d = new Date(s); if (!isNaN(d.getTime())) return Utilities.formatDate(d, TZ, 'yyyy-MM-dd');
+  return s;
+}
+function getSummaryRowIndex_(sh, ymd, map){
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return 0;
+  const candidateCols = [];
+  if (map.ts) candidateCols.push(map.ts);
+  if (!candidateCols.includes(1)) candidateCols.push(1);
+  for (const col of candidateCols){
+    const rng = sh.getRange(2, col, lastRow-1, 1);
+    const vals = rng.getValues();
+    for (let i=0;i<vals.length;i++){
+      if (cellToYmd_(vals[i][0]) === ymd) return 2 + i;
+    }
+  }
+  return 0;
+}
+
+/************* LATEST PULL (กันศูนย์หลังตัดรอบ) *************/
+/************* LATEST PULL (กันศูนย์หลังตัดรอบ) *************/
+function latestFromData_(sh){
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return null;
+
+  const lastCol  = sh.getLastColumn();
+  const LOOKBACK = Math.min(2000, lastRow - 1); // ลึก ~1.5 วัน (โพสต์ทุกนาที)
+  const startRow = lastRow - LOOKBACK + 1;
+  const rows     = sh.getRange(startRow, 1, LOOKBACK, lastCol).getValues();
+
+  // จำ prev ล่าสุดที่ไม่เป็นศูนย์ระหว่างไล่ย้อน
+  let lastPrevD = 0, lastPrevW = 0, lastPrevM = 0;
+
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i];
+
+    // mapping: 0 ts, 15 dailyWh, 16 weeklyWh, 17 dailyWhPrev, 18 weeklyWhPrev, 19 monthWh, 20 monthWhPrev
+    const ts            = row[0];
+    const dailyWh       = Number(row[15] || 0);
+    const weeklyWh      = Number(row[16] || 0);
+    const dailyWhPrev   = Number(row[17] || 0);
+    const weeklyWhPrev  = Number(row[18] || 0);
+    const monthWh       = Number(row[19] || 0);
+    const monthWhPrev   = Number(row[20] || 0);
+
+    if (dailyWhPrev  > 0 && lastPrevD === 0) lastPrevD = dailyWhPrev;
+    if (weeklyWhPrev > 0 && lastPrevW === 0) lastPrevW = weeklyWhPrev;
+    if (monthWhPrev  > 0 && lastPrevM === 0) lastPrevM = monthWhPrev;
+
+    const effDaily   = dailyWh  > 0 ? dailyWh  : (dailyWhPrev  > 0 ? dailyWhPrev  : 0);
+    const effWeekly  = weeklyWh > 0 ? weeklyWh : (weeklyWhPrev > 0 ? weeklyWhPrev : 0);
+    const effMonthly = monthWh  > 0 ? monthWh  : (monthWhPrev  > 0 ? monthWhPrev  : 0);
+
+    if (effDaily > 0 || effWeekly > 0 || effMonthly > 0 ||
+        dailyWhPrev > 0 || weeklyWhPrev > 0 || monthWhPrev > 0) {
+
+      // ถ้า prev ของแถวนี้ยังเป็น 0 ให้ใช้ prev ล่าสุดที่เก็บมา
+      const outPrevD = dailyWhPrev  > 0 ? dailyWhPrev  : lastPrevD;
+      const outPrevW = weeklyWhPrev > 0 ? weeklyWhPrev : lastPrevW;
+      const outPrevM = monthWhPrev  > 0 ? monthWhPrev  : lastPrevM;
+
+      const ymd = (ts instanceof Date)
+        ? Utilities.formatDate(ts, TZ, 'yyyyMMdd')
+        : Utilities.formatDate(new Date(ts), TZ, 'yyyyMMdd');
+      const tsISO = (ts instanceof Date)
+        ? Utilities.formatDate(ts, TZ, "yyyy-MM-dd'T'HH:mm:ss")
+        : String(ts);
+
+      return {
+        ok: true,
+        row: startRow + i,
+        tsISO: tsISO,
+        ymd: Number(ymd),
+        dWh: effDaily,
+        wWh: effWeekly,
+        mWh: effMonthly,
+        dWhPrev: outPrevD || 0,
+        wWhPrev: outPrevW || 0,
+        mWhPrev: outPrevM || 0
+      };
+    }
+  }
+  return { ok:false, reason:'NO_MEANINGFUL_DATA' };
+}
+
