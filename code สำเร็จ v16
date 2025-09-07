@@ -20,16 +20,16 @@ static bool tripA_flag = false;
 static bool tripB_flag = false;
 
 /* ==== Reset Time Config ==== */
-const int RESET_HOUR = 23;   // 00-23
-const int RESET_MIN  = 59;   // 00-59
-#define STBY_REPEAT_MIN 60   // Standby repeat minutes
+const int RESET_HOUR = 23;    // 0-23
+const int RESET_MIN  = 59;    // 0-59
+#define STBY_REPEAT_MIN 60    // Standby repeat minutes
 
 // Weekly cutoff (0=Sun..6=Sat)
 const int WEEKLY_DOW = 4;
 
 /* ===== Monthly cutoff config ===== */
 // วันที่ของเดือนที่จะตัดรอบ (1–31). ถ้าเดือนไหนมีวันน้อยกว่า จะตัดที่วันสุดท้ายของเดือน
-const int MONTHLY_DOM = 6;
+const int MONTHLY_DOM = 7;
 
 /* ===== Pin map ===== */
 #ifndef D2
@@ -510,14 +510,15 @@ bool didResetToday=false;
 /* === Restore mode === */
 #define ENERGY_RESTORE_MODE 2
 
-/* ==== NEW: Month seeding helper (ให้เดือน ≥ วัน/สัปดาห์เสมอ) ==== */
-static inline bool seedMonthFromDWorW() {
-  double target = g_monthWh;
-  if (g_weeklyWh > target) target = g_weeklyWh;
-  if (g_dailyWh  > target) target = g_dailyWh;
+/* ==== NEW: Month seeding helper (เดือน ≥ วัน เท่านั้น) ==== */
+/* Lock: อนุญาต seed เฉพาะก่อนตัดรอบเดือนของเดือนนั้น ๆ */
+bool allowMonthSeed = true;
 
-  if (target > g_monthWh + 1e-6) {
-    g_monthWh   = target;
+static inline bool seedMonthFromDailyOnly() {
+  if (!allowMonthSeed) return false;           // กันเด้งหลังรีเซ็ต/ตัดรอบแล้ว
+  // ไม่ใช้ weekly เพื่อกันค่ากระโดดจากสัปดาห์ที่ยังไม่ตัดรอบ
+  if (g_dailyWh > g_monthWh + 1e-6) {
+    g_monthWh   = g_dailyWh;
     monthWh     = roundf(g_monthWh*100.0f)/100.0f;
     monthWh_str = withUnit((float)g_monthWh, 2, "Wh");
     monthPct    = (monthWhPrev>0.0f)?((monthWh-monthWhPrev)/monthWhPrev)*100.0f:0.0f;
@@ -579,8 +580,9 @@ void sendWeeklySummary(bool doRollover){
   Serial.println(String("[WEEKLY] ") + ws + (doRollover ? " (ROLLOVER)" : " (ANNOUNCE ONLY)"));
 }
 
-/* ==== Monthly summary ==== */
+/* ==== Monthly summary (reworked) ==== */
 void sendMonthlySummary(bool doRollover){
+  // คำนวณค่าพลังงานของเดือนนี้/เดือนก่อน
   float thisM = (float)round2(g_monthWh);
   float lastM = (float)round2(g_monthWhPrev);
 
@@ -601,11 +603,14 @@ void sendMonthlySummary(bool doRollover){
   ArduinoCloud.update();
   setInfoMessageSticky(ms, 120000UL);
 
-  if (doRollover) {
+  // ย้ายค่าเดือน -> เดือนก่อน เฉพาะครั้งแรกของเดือนนี้เท่านั้น
+  if (doRollover && !monthlyRolledThisMonth) {
     g_monthWhPrev = g_monthWh;
     g_monthWh     = 0.0;
     monthlyRolledThisMonth = true;
+    allowMonthSeed = false;  // หลังตัดรอบแล้วห้าม seed เดือนเด้งกลับ
   }
+
   Serial.println(String("[MONTHLY] ") + ms + (doRollover ? " (ROLLOVER)" : " (ANNOUNCE ONLY)"));
 }
 
@@ -694,36 +699,35 @@ void loadEnergyStateAtBoot(){
 
           float sd  = doc["dWh"]     | 0.0f;
           float sw  = doc["wWh"]     | 0.0f;
-          float sm  = doc["mWh"]     | 0.0f;    // <<<<<< NEW
+          float sm  = doc["mWh"]     | 0.0f;
           float sdp = doc["dWhPrev"] | 0.0f;
           float swp = doc["wWhPrev"] | 0.0f;
-          float smp = doc["mWhPrev"] | 0.0f;    // <<<<<< NEW
+          float smp = doc["mWhPrev"] | 0.0f;
 
           bool updated=false;
           if (sd > g_dailyWh)  { g_dailyWh  = sd;  updated=true; }
           if (sw > g_weeklyWh) { g_weeklyWh = sw;  updated=true; }
-          if (sm > g_monthWh)  { g_monthWh  = sm;  updated=true; }  // <<<<<< NEW
+          if (sm > g_monthWh)  { g_monthWh  = sm;  updated=true; }
 
           g_dailyWhPrev  = sdp;
           g_weeklyWhPrev = swp;
-          g_monthWhPrev  = smp;                                     // <<<<<< NEW
+          g_monthWhPrev  = smp;
 
-          // sync ขึ้น Cloud เป็นค่าทศนิยม 2 ตำแหน่ง + string
           dailyWh      = roundf(g_dailyWh*100.0f)/100.0f;
           weeklyWh     = roundf(g_weeklyWh*100.0f)/100.0f;
-          monthWh      = roundf(g_monthWh*100.0f)/100.0f;           // <<<<<< NEW
+          monthWh      = roundf(g_monthWh*100.0f)/100.0f;
 
           dailyWhPrev  = roundf(g_dailyWhPrev*100.0f)/100.0f;
           weeklyWhPrev = roundf(g_weeklyWhPrev*100.0f)/100.0f;
-          monthWhPrev  = roundf(g_monthWhPrev*100.0f)/100.0f;       // <<<<<< NEW
+          monthWhPrev  = roundf(g_monthWhPrev*100.0f)/100.0f;
           monthPct     = (monthWhPrev>0.0f)?((monthWh-monthWhPrev)/monthWhPrev)*100.0f:0.0f;
 
           dailyWh_str      = withUnit(dailyWh,      2, "Wh");
           weeklyWh_str     = withUnit(weeklyWh,     2, "Wh");
-          monthWh_str      = withUnit(monthWh,      2, "Wh");       // <<<<<< NEW
+          monthWh_str      = withUnit(monthWh,      2, "Wh");
           dailyWhPrev_str  = withUnit(dailyWhPrev,  2, "Wh");
           weeklyWhPrev_str = withUnit(weeklyWhPrev, 2, "Wh");
-          monthWhPrev_str  = withUnit(monthWhPrev,  2, "Wh");       // <<<<<< NEW
+          monthWhPrev_str  = withUnit(monthWhPrev,  2, "Wh");
           ArduinoCloud.update();
 
           if (updated) persistEnergyIfNeeded();
@@ -739,8 +743,8 @@ void loadEnergyStateAtBoot(){
     }
   }
 
-  // --- Ensure month ≥ day/week after restore/pull
-  if (seedMonthFromDWorW()) {
+  // --- Ensure month ≥ day only (ไม่อิงสัปดาห์) หลัง restore/pull (เฉพาะเมื่ออนุญาต)
+  if (seedMonthFromDailyOnly()) {
     ArduinoCloud.update();
     persistEnergyIfNeeded();
   }
@@ -833,13 +837,13 @@ bool pullLatestFromSheet(){
       return true;
     };
 
-    double dWh=0,wWh=0,mWh=0, dWhPrev=0,wWhPrev=0,mWhPrev=0;          // <<<<<< NEW fields
+    double dWh=0,wWh=0,mWh=0, dWhPrev=0,wWhPrev=0,mWhPrev=0;
     bool ok1=findNum("dWh", dWh);
     bool ok2=findNum("wWh", wWh);
-    bool ok3=findNum("mWh", mWh);                                     // <<<<<< NEW
+    bool ok3=findNum("mWh", mWh);
     bool ok4=findNum("dWhPrev", dWhPrev);
     bool ok5=findNum("wWhPrev", wWhPrev);
-    bool ok6=findNum("mWhPrev", mWhPrev);                             // <<<<<< NEW
+    bool ok6=findNum("mWhPrev", mWhPrev);
     if (!(ok1 && ok2 && ok3)) {
       Serial.printf("[SheetPull] missing fields (d=%d w=%d m=%d)\n", ok1, ok2, ok3);
       return false;
@@ -848,18 +852,18 @@ bool pullLatestFromSheet(){
     bool updated=false;
     if (dWh > g_dailyWh)  { g_dailyWh  = dWh;  updated=true; }
     if (wWh > g_weeklyWh) { g_weeklyWh = wWh;  updated=true; }
-    if (mWh > g_monthWh)  { g_monthWh  = mWh;  updated=true; }        // <<<<<< NEW
+    if (mWh > g_monthWh)  { g_monthWh  = mWh;  updated=true; }
 
     g_dailyWhPrev  = dWhPrev;
     g_weeklyWhPrev = wWhPrev;
-    g_monthWhPrev  = mWhPrev;                                         // <<<<<< NEW
+    g_monthWhPrev  = mWhPrev;
 
     dailyWh      = roundf(g_dailyWh*100.0f)/100.0f;
     weeklyWh     = roundf(g_weeklyWh*100.0f)/100.0f;
-    monthWh      = roundf(g_monthWh*100.0f)/100.0f;                   // <<<<<< NEW
+    monthWh      = roundf(g_monthWh*100.0f)/100.0f;
     dailyWhPrev  = roundf(g_dailyWhPrev*100.0f)/100.0f;
     weeklyWhPrev = roundf(g_weeklyWhPrev*100.0f)/100.0f;
-    monthWhPrev  = roundf(g_monthWhPrev*100.0f)/100.0f;               // <<<<<< NEW
+    monthWhPrev  = roundf(g_monthWhPrev*100.0f)/100.0f;
     monthPct     = (monthWhPrev>0.0f)?((monthWh-monthWhPrev)/monthWhPrev)*100.0f:0.0f;
 
     dailyWh_str      = withUnit(dailyWh,      2, "Wh");
@@ -872,9 +876,8 @@ bool pullLatestFromSheet(){
 
     ArduinoCloud.update();
 
-
-    // --- Ensure month ≥ day/week after sheet pull
-    if (seedMonthFromDWorW()) {
+    // --- Ensure month ≥ day only (ไม่อิงสัปดาห์) หลังดึงจากชีต
+    if (seedMonthFromDailyOnly()) {
       ArduinoCloud.update();
       persistEnergyIfNeeded();
     }
@@ -999,7 +1002,6 @@ void loop(){
     weeklyWhPrev_str = withUnit(weeklyWhPrev, 2, "Wh");
     monthWh_str      = withUnit((float)g_monthWh,     2, "Wh");
     monthWhPrev_str  = withUnit((float)g_monthWhPrev, 2, "Wh");
-
 
     ArduinoCloud.update();
     reappliedAfterCloud = true;
@@ -1219,11 +1221,6 @@ void loop(){
     }
     // ==== end energy updates ====
 
-    // --- Ensure month ≥ day/week every loop tick after updates
-    if (seedMonthFromDWorW()) {
-      ArduinoCloud.update();
-    }
-
     persistEnergyIfNeeded();
 
     Serial.printf("[DBG] IA=%.3fA IB=%.3fA ALL=%.3fA vA=%.1f vB=%.1f vALL=%.1f P=%.2fW\n",
@@ -1285,6 +1282,7 @@ void loop(){
       if (ymNow != lastYm_forMonthly) {
         monthlyRolledThisMonth = false;
         lastMonthlySentKey = 0;
+        allowMonthSeed = true;  // เดือนใหม่ เริ่มเปิดให้ seed ได้จนกว่าจะตัดรอบ
         lastYm_forMonthly = ymNow;
       }
       if (isMonthlyCutoffToday(loc) &&
@@ -1392,7 +1390,6 @@ void cancelTimers(char which){
 
   statusNow = "";
   updateStatusNow();
-  ArduinoCloud.update();
 }
 
 void onStandbyAlertChange() { /* no-op */ }
@@ -1643,10 +1640,6 @@ void onResetDailyChange() {
     needImmediatePost = true;
     resetDaily = false;
 
-    // (แนะนำ) ให้เดือน ≥ วัน/สัปดาห์ เสมอหลังรีเซ็ต
-    seedMonthFromDWorW();
-    ArduinoCloud.update();
-
     Serial.println("[Cloud] Reset DAILY: cleared.");
   }
 }
@@ -1662,30 +1655,25 @@ void onResetWeeklyChange() {
     lastWeeklySentKey = 0;
     resetWeekly = false;
 
-    // (แนะนำ)
-    seedMonthFromDWorW();
-    ArduinoCloud.update();
-
     Serial.println("[Cloud] Reset WEEKLY: cleared.");
   }
 }
 void onResetMonthlyChange() {
   if (resetMonthly) {
+    // ไม่แตะ g_monthWhPrev เพื่อเก็บค่าเดือนก่อน
     g_monthWh = 0.0;     monthWh = 0.0f;
-    g_monthWhPrev = 0.0; monthWhPrev = 0.0f;
-    monthPct = 0.0f;
+    monthPct = (monthWhPrev>0.0f)?((monthWh-monthWhPrev)/monthWhPrev)*100.0f:0.0f;
+
     monthlySummary = "ใช้ไฟเดือนนี้: 0.00 Wh 0% (เริ่มต้น) | แนะนำ: " + getTip();
     needImmediatePost = true;
     g_justMonthlyReset = true;
-    monthlyRolledThisMonth = false;
+
+    monthlyRolledThisMonth = true;  // ถือว่าเดือนนี้รีเซ็ตแล้ว
     lastMonthlySentKey = 0;
+    allowMonthSeed = false;         // กัน seed เด้งกลับ
     resetMonthly = false;
 
-    // (แนะนำ) ถ้าต้องการให้เดือน ≥ วัน/สัปดาห์เสมอ แม้กดรีเซ็ตเดือน
-    seedMonthFromDWorW();
-    ArduinoCloud.update();
-
-    Serial.println("[Cloud] Reset MONTHLY: cleared.");
+    Serial.println("[Cloud] Reset MONTHLY: cleared (keep previous month).");
   }
 }
 
@@ -1765,4 +1753,3 @@ __attribute__((constructor)) static void _startStandbyTask(){
   // Non-ESP32: call StandbyTask from loop if needed
 #endif
 }
-
