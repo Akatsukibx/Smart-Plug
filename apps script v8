@@ -1,0 +1,438 @@
+/************* CONFIG *************/
+const DATA_SHEET    = 'Data';
+const LOG_SHEET     = 'Log';
+const SUMMARY_SHEET = 'Summary';
+const EXPECTED      = 'Smart_Plug';
+const TZ            = 'Asia/Bangkok';
+
+/************* Web App Entrypoints *************/
+function doPost(e){ return handleReq(e, 'POST'); }
+function doGet(e){  return handleReq(e, 'GET');  }
+
+/************* Main Handler *************/
+function handleReq(e, method){
+  const ss     = SpreadsheetApp.getActive();
+  const dataSh = ss.getSheetByName(DATA_SHEET)    || ss.insertSheet(DATA_SHEET);
+  const logSh  = ss.getSheetByName(LOG_SHEET)     || ss.insertSheet(LOG_SHEET);
+  const sumSh  = ss.getSheetByName(SUMMARY_SHEET) || ss.insertSheet(SUMMARY_SHEET);
+
+  ensureDataHeader_(dataSh);
+  ensureSummaryHeader_(sumSh);
+  ensureLogHeader_(logSh);
+
+  // ---- Parse payload ----
+  const safe    = e || {};
+  const headers = safe.headers || {};
+  const ct  = String(headers['content-type'] || headers['Content-Type'] || (safe.postData && safe.postData.type) || '').toLowerCase();
+  const raw = (safe.postData && safe.postData.contents) || '';
+  let d = {};
+  try {
+    try { d = JSON.parse(raw || '{}'); } catch (_) {}
+    if (!Object.keys(d).length && Object.keys(safe.parameter || {}).length) d = safe.parameter;
+    if (!Object.keys(d).length && raw) d = parsePlain(raw);
+  } catch (err) {
+    logSh.appendRow([new Date(), method, 'parse-error', String(err), raw]);
+    return ContentService.createTextOutput('BAD_PAYLOAD');
+  }
+
+  // ---- Auth (secret) ----
+  const secret = headers['x-secret'] || headers['X-Secret'] || (d.k || d.K) ||
+                 (safe.parameter && (safe.parameter.k || safe.parameter.K)) || '';
+  const ok = EXPECTED ? (secret === EXPECTED) : true;
+
+  logSh.appendRow([new Date(), method, 'ct='+ct, 'secret='+(ok?'ok':'bad'), raw || JSON.stringify(d)]);
+  if (!ok) return ContentService.createTextOutput('FORBIDDEN');
+
+  // ---- Pull latest ----
+  const ctParam = String((d.ct || (safe.parameter && safe.parameter.ct) || '')).trim().toLowerCase();
+  if (ctParam === 'pull_state' || ctParam === 'last') {
+    const latest = latestFromData_(dataSh);
+    return ContentService
+      .createTextOutput(JSON.stringify(latest || { ok:false, reason:'NO_DATA' }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // ---- Peak window today (for device daily message) ----
+  if (ctParam === 'peak_today') {
+    const res = peakTodayWindowFromData_(dataSh, 30); // วินโดว์ 30 นาที
+    return ContentService
+      .createTextOutput(JSON.stringify(res))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // ---- Write Data (live ทุกนาที) ----
+  const now   = new Date();
+  const ymd   = Utilities.formatDate(now, TZ, 'yyyy-MM-dd');
+
+  // peak ของวันนี้ (อิง Data เดิม + ค่าส่งเข้ามา)
+  const prevPeakToday = readLastPeakToday_(dataSh, ymd);
+  const dWhNow        = num(d.dWh) || 0;
+  const incomingPeak  = Number(d.peakdailyWh || 0);
+  const peakToday     = Math.max(dWhNow, incomingPeak, prevPeakToday);
+
+  const dataRow = [
+    now,                    // ts (A)
+    onoff(d.swA), onoff(d.swB),
+    num(d.iIn), num(d.vIn),
+    num(d.vA), num(d.vB),
+    num(d.iA), num(d.iB),
+    num(d.pA), num(d.pB),
+    num(d.tC), num(d.hum),
+    tripText(d.tripA), tripText(d.tripB),
+
+    // === ENERGY (P..U) ===
+    num(d.dWh),        // 15 → P  dailyWh
+    num(d.wWh),        // 16 → Q  weeklyWh
+    num(d.dWhPrev),    // 17 → R  dailyWhPrev
+    num(d.wWhPrev),    // 18 → S  weeklyWhPrev
+    num(d.mWh),        // 19 → T  monthWh
+    num(d.mWhPrev),    // 20 → U  monthWhPrev
+
+    // === Peak of the day (V) ===
+    peakToday          // 21 → V  peakdailyWh
+  ];
+  dataSh.appendRow(dataRow);
+  SpreadsheetApp.flush();
+
+  // ---- Summary: บันทึก “เฉพาะตอนตัดรอบ” วันละ 1 แถว ----
+  appendSummary_ON_CUT_ONLY_(sumSh, d, dataSh);
+
+  // (optional) log
+  if (String(d.ct || '') === 'summary') {
+    logSh.appendRow([new Date(), 'SUMMARY', d.dailySummary || '', d.adviceSummary || '']);
+  }
+  if (String(d.ct || '') === 'monthly') {
+    logSh.appendRow([new Date(), 'MONTHLY', d.monthlySummary || '', '']);
+  }
+  if (String(d.weeklySummary_any || '')) {
+    logSh.appendRow([new Date(), 'WEEKLY_ANY', d.weeklySummary_any, '']);
+  }
+  if (String(d.monthlySummary_any || '')) {
+    logSh.appendRow([new Date(), 'MONTHLY_ANY', d.monthlySummary_any, '']);
+  }
+
+  return ContentService.createTextOutput('OK');
+}
+
+/************* Data header (ต้องสอดคล้องกับ latestFromData_) *************/
+function ensureDataHeader_(sh){
+  const want = [
+    'ts','swA','swB','iIn','vIn','vA','vB','iA','iB','pA','pB',
+    'tC','hum','tripA','tripB',
+    'dailyWh','weeklyWh','dailyWhPrev','weeklyWhPrev','monthWh','monthWhPrev',
+    'peakdailyWh' // V
+  ];
+  if (sh.getLastRow() === 0){
+    sh.appendRow(want);
+  } else {
+    const header = sh.getRange(1,1,1,sh.getMaxColumns()).getValues()[0].map(x=>String(x||'').trim());
+    if (header.length < want.length){
+      sh.getRange(1, header.length+1, 1, want.length-header.length)
+        .setValues([want.slice(header.length)]);
+    }
+  }
+}
+
+/************* Summary header *************/
+function ensureSummaryHeader_(sh){
+  // A..J : ts, dailyWh, dailyWhPrev, weeklyWh, weeklyWhPrev, monthWh, monthWhPrev, peakdailyWh, peakmonthWh, tips
+  const want = ['ts','dailyWh','dailyWhPrev','weeklyWh','weeklyWhPrev','monthWh','monthWhPrev','peakdailyWh','peakmonthWh','tips'];
+  if (sh.getLastRow() === 0){
+    sh.appendRow(want);
+    return;
+  }
+  const header = sh.getRange(1,1,1,sh.getMaxColumns()).getValues()[0].map(x=>String(x||'').trim());
+  if (header.length < want.length){
+    sh.getRange(1, header.length+1, 1, want.length-header.length).setValues([want.slice(header.length)]);
+  }
+}
+
+/************* Log header *************/
+function ensureLogHeader_(sh){
+  if (sh.getLastRow() === 0){
+    sh.appendRow(['ts','method','tag','info']);
+  }
+}
+
+/**
+ * เขียน Summary “เฉพาะตอนตัดรอบ”
+ * - cut (หลังตัด): dWh ≈ 0 && dWhPrev > 0
+ * - วันละแถวเดียว: ถ้ามีแถวของวันนี้อยู่แล้ว → อัปเดตค่า/ข้อความแทน
+ * - ค่าโชว์: ใช้ dWhPrev/wWhPrev/mWhPrev เป็นค่า effective เพื่อไม่ให้เป็น 0
+ * - peakdailyWh (H) คำนวณจาก Data ของวันนั้น (คอลัมน์ V)
+ * - peakmonthWh (I) เก็บไว้เฉย ๆ (ตอนนี้ยังไม่คำนวณ)
+ */
+function appendSummary_ON_CUT_ONLY_(sh, d, dataSh){
+  const nearZero = v => Math.abs(Number(v)||0) < 1e-6;
+
+  const dWh      = Number(d.dWh)||0;
+  const dWhPrev  = Number(d.dWhPrev||0);
+  const wWh      = Number(d.wWh)||0;
+  const wWhPrev  = Number(d.wWhPrev)||0;
+  const mWh      = Number(d.mWh)||0;
+  const mWhPrev  = Number(d.mWhPrev)||0;
+
+  const isCut = ( nearZero(dWh) && !nearZero(dWhPrev) );
+  if (!isCut) return;
+
+  const dailyEff   = dWhPrev;
+  const weeklyEff  = !nearZero(wWh) ? wWh : ( !nearZero(wWhPrev) ? wWhPrev : dWhPrev );
+  const monthlyEff = !nearZero(mWh) ? mWh : ( !nearZero(mWhPrev) ? mWhPrev : 0 );
+
+  const dailyMsg   = String(d.dailySummary || '').trim();
+  const advice     = String(d.adviceSummary || '').trim();
+  const monthlyMsg = String(d.monthlySummary || d.monthlySummary_any || '').trim();
+
+  let tipsText = dailyMsg;
+  if (advice)     tipsText = tipsText ? (tipsText + ' | แนะนำ: ' + advice) : ('แนะนำ: ' + advice);
+  if (monthlyMsg) tipsText = tipsText ? (tipsText + ' | ' + monthlyMsg) : monthlyMsg;
+
+  const now = new Date();
+  const ymd = Utilities.formatDate(now, TZ, 'yyyy-MM-dd');
+
+  // คำนวณ peak ของวันจาก Data! (คอลัมน์ V)
+  const peakD = calcPeakDailyForYmd_(dataSh, ymd);
+  const peakM = Number(d.peakmonthWh || 0); // เผื่อรับมา — ยังไม่ใช้คำนวณ
+
+  // ถ้ามีแถวของวันนี้อยู่แล้ว → อัปเดต
+  const lastRow = sh.getLastRow();
+  if (lastRow > 1){
+    const rows = sh.getRange(2,1,lastRow-1,1).getValues();
+    for (let i=0;i<rows.length;i++){
+      const cell = rows[i][0];
+      const cellYmd = (cell instanceof Date) ? Utilities.formatDate(cell, TZ, 'yyyy-MM-dd') : String(cell||'').trim();
+      if (cellYmd === ymd){
+        sh.getRange(i+2, 2, 1, 6).setValues([[dailyEff, dWhPrev, weeklyEff, wWhPrev, monthlyEff, mWhPrev]]);
+        sh.getRange(i+2, 8, 1, 2).setValues([[peakD, peakM]]); // H, I
+        sh.getRange(i+2, 10).setValue(tipsText);               // J
+        return;
+      }
+    }
+  }
+
+  // ยังไม่มีแถวของวันนี้ → สร้างใหม่
+  sh.appendRow([ymd, dailyEff, dWhPrev, weeklyEff, wWhPrev, monthlyEff, mWhPrev, peakD, peakM, tipsText]);
+}
+
+/************* Helpers *************/
+function num(x){ return (x === '' || x === null || x === undefined) ? '' : Number(x); }
+function isTrue(v){ return v===true || v===1 || v==='1' || String(v).toLowerCase()==='true' || v==='เปิด' || v==='ตัดแล้ว'; }
+function onoff(v){ return isTrue(v) ? 'เปิด' : 'ปิด'; }
+function tripText(v){ return isTrue(v) ? 'ตัดแล้ว' : 'ปกติ'; }
+
+// ✅ parser: urlencoded/kv หรือ CSV 'a,b,c'
+function parsePlain(raw){
+  const res = {};
+  const parts = raw.split(/[,|]/).map(s => s.trim());
+  if (parts.length >= 21){ // มี peakdailyWh
+    [res.swA,res.swB,res.iIn,res.vIn,res.vA,res.vB,res.iA,res.iB,res.pA,res.pB,res.tC,res.hum,res.tripA,res.tripB,
+     res.dWh,res.wWh,res.dWhPrev,res.wWhPrev,res.mWh,res.mWhPrev,res.peakdailyWh] = parts;
+    return res;
+  }
+  raw.split(/[\n&]+/).forEach(seg=>{
+    if (!seg) return;
+    const i = seg.indexOf('=');
+    if (i >= 0){
+      const k = seg.slice(0,i).trim();
+      const v = seg.slice(i+1).trim();
+      if (k) res[k] = v;
+    } else {
+      const k = seg.trim();
+      if (k) res[k] = '';
+    }
+  });
+  return res;
+}
+
+/************* (optional) Column/row helpers *************/
+function getColMap_(sh, keys){
+  const header = sh.getRange(1,1,1,sh.getMaxColumns()).getValues()[0];
+  const map = {};
+  for (let c=1;c<=header.length;c++){
+    const name = String(header[c-1]||'').trim();
+    if (!name) continue;
+    keys.forEach(k=>{ if (name===k && !map[k]) map[k]=c; });
+  }
+  return map;
+}
+function cellToYmd_(v){
+  if (v instanceof Date) return Utilities.formatDate(v, TZ, 'yyyy-MM-dd');
+  const s = String(v||'').trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const d = new Date(s); if (!isNaN(d.getTime())) return Utilities.formatDate(d, TZ, 'yyyy-MM-dd');
+  return s;
+}
+function getSummaryRowIndex_(sh, ymd, map){
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return 0;
+  const candidateCols = [];
+  if (map.ts) candidateCols.push(map.ts);
+  if (!candidateCols.includes(1)) candidateCols.push(1);
+  for (const col of candidateCols){
+    const rng = sh.getRange(2, col, lastRow-1, 1);
+    const vals = rng.getValues();
+    for (let i=0;i<vals.length;i++){
+      if (cellToYmd_(vals[i][0]) === ymd) return 2 + i;
+    }
+  }
+  return 0;
+}
+
+/************* Utility: อ่าน peak ของวันล่าสุดจาก Data!V *************/
+function readLastPeakToday_(sh, ymdStr){
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return 0;
+  const lastTs = sh.getRange(lastRow, 1).getValue();
+  const lastYmd = cellToYmd_(lastTs);
+  if (lastYmd !== ymdStr) return 0;
+  const lastPeak = Number(sh.getRange(lastRow, 22).getValue() || 0); // V = 22
+  return lastPeak || 0;
+}
+
+/************* Utility: คำนวณ peakdailyWh จาก Data ของวันนั้น *************/
+function calcPeakDailyForYmd_(dataSh, ymdStr){
+  const lastRow = dataSh.getLastRow();
+  if (lastRow < 2) return 0;
+
+  const tsCol = dataSh.getRange(2, 1,  lastRow-1, 1).getValues(); // ts
+  const pCol  = dataSh.getRange(2, 16, lastRow-1, 1).getValues(); // P: dailyWh
+  let peak = 0;
+
+  // P (dailyWh) ของวันนั้น
+  for (let i=0;i<tsCol.length;i++){
+    const ymd = cellToYmd_(tsCol[i][0]);
+    if (ymd === ymdStr){
+      const dwh = Number(pCol[i][0] || 0);
+      if (dwh > peak) peak = dwh;
+    }
+  }
+  // รวมกับ V (peakdailyWh) เผื่อเคยบันทึกไว้
+  const vCol = dataSh.getRange(2, 22, lastRow-1, 1).getValues(); // V
+  for (let i=0;i<tsCol.length;i++){
+    const ymd = cellToYmd_(tsCol[i][0]);
+    if (ymd === ymdStr){
+      const v = Number(vCol[i][0] || 0);
+      if (v > peak) peak = v;
+    }
+  }
+  return peak;
+}
+
+/************* Peak window of today for device (&ct=peak_today) *************/
+function peakTodayWindowFromData_(sh, windowMin){
+  const WMIN   = windowMin || 30;
+  const now    = new Date();
+  const todayY = Utilities.formatDate(now, TZ, 'yyyy-MM-dd');
+
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return { ok:false, reason:'NO_DATA' };
+
+  // A = ts, P = dailyWh
+  const tsCol = sh.getRange(2, 1,  lastRow-1, 1).getValues();
+  const dCol  = sh.getRange(2, 16, lastRow-1, 1).getValues();
+
+  const rows = [];
+  for (let i=0;i<tsCol.length;i++){
+    const ts = tsCol[i][0];
+    if (!ts) continue;
+    const ymd = cellToYmd_(ts);
+    if (ymd === todayY){
+      const t   = (ts instanceof Date) ? ts : new Date(ts);
+      const dwh = Number(dCol[i][0] || 0);
+      rows.push({ t, dwh });
+    }
+  }
+  if (rows.length < 2) return { ok:false, reason:'NOT_ENOUGH' };
+
+  // แตกเป็น “นาที” + ปริมาณพลังงานเพิ่มขึ้นต่อหนึ่งนาที
+  const mins = [];
+  for (let i=1;i<rows.length;i++){
+    const prev = rows[i-1], cur = rows[i];
+    let inc = cur.dwh - prev.dwh; if (inc < 0) inc = 0;
+    const dtMin = Math.max(1, Math.round((cur.t - prev.t)/60000));
+    const perMin = inc / dtMin;
+    for (let k=0;k<dtMin;k++){
+      mins.push({ t: new Date(prev.t.getTime() + (k+1)*60000), inc: perMin });
+    }
+  }
+  if (!mins.length) return { ok:false, reason:'NO_MIN_SAMPLES' };
+
+  // สไลด์วินโดว์ WMIN นาที หา sum สูงสุด
+  let bestSum = 0, bestStart = mins[0].t;
+  let sum = 0, L = 0;
+  for (let R=0; R<mins.length; R++){
+    sum += mins[R].inc;
+    while ((mins[R].t - mins[L].t) >= WMIN*60000){
+      sum -= mins[L].inc; L++;
+    }
+    if (sum > bestSum){
+      bestSum  = sum;
+      bestStart = new Date(mins[R].t.getTime() - (WMIN-1)*60000);
+    }
+  }
+
+  const startStr = Utilities.formatDate(bestStart, TZ, 'HH:mm');
+  const endStr   = Utilities.formatDate(new Date(bestStart.getTime()+WMIN*60000), TZ, 'HH:mm');
+  return { ok:true, start:startStr, end:endStr, avgWh: Math.round(bestSum*100)/100 };
+}
+
+/************* LATEST PULL (กันศูนย์หลังตัดรอบ) *************/
+function latestFromData_(sh){
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return null;
+
+  const lastCol  = sh.getLastColumn();
+  const LOOKBACK = Math.min(2000, lastRow - 1); // ~1.5 วัน (ส่งทุกนาที)
+  const startRow = lastRow - LOOKBACK + 1;
+  const rows     = sh.getRange(startRow, 1, LOOKBACK, lastCol).getValues();
+
+  // จำ prev ล่าสุดที่ไม่เป็นศูนย์ระหว่างไล่ย้อน
+  let lastPrevD = 0, lastPrevW = 0, lastPrevM = 0;
+
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i];
+
+    // mapping: 0 ts, 15 dailyWh, 16 weeklyWh, 17 dailyWhPrev, 18 weeklyWhPrev, 19 monthWh, 20 monthWhPrev
+    const ts            = row[0];
+    const dailyWh       = Number(row[15] || 0);
+    const weeklyWh      = Number(row[16] || 0);
+    const dailyWhPrev   = Number(row[17] || 0);
+    const weeklyWhPrev  = Number(row[18] || 0);
+    const monthWh       = Number(row[19] || 0);
+    const monthWhPrev   = Number(row[20] || 0);
+    // row[21] = peakdailyWh (ไม่จำเป็นต่อ pull state)
+
+    if (dailyWhPrev  > 0 && lastPrevD === 0) lastPrevD = dailyWhPrev;
+    if (weeklyWhPrev > 0 && lastPrevW === 0) lastPrevW = weeklyWhPrev;
+    if (monthWhPrev  > 0 && lastPrevM === 0) lastPrevM = monthWhPrev;
+
+    const effDaily   = dailyWh  > 0 ? dailyWh  : (dailyWhPrev  > 0 ? dailyWhPrev  : 0);
+    const effWeekly  = weeklyWh > 0 ? weeklyWh : (weeklyWhPrev > 0 ? weeklyWhPrev : 0);
+    const effMonthly = monthWh  > 0 ? monthWh  : (monthWhPrev  > 0 ? monthWhPrev  : 0);
+
+    if (effDaily > 0 || effWeekly > 0 || effMonthly > 0 ||
+        dailyWhPrev > 0 || weeklyWhPrev > 0 || monthWhPrev > 0) {
+
+      const ymd = (ts instanceof Date)
+        ? Utilities.formatDate(ts, TZ, 'yyyyMMdd')
+        : Utilities.formatDate(new Date(ts), TZ, 'yyyyMMdd');
+      const tsISO = (ts instanceof Date)
+        ? Utilities.formatDate(ts, TZ, "yyyy-MM-dd'T'HH:mm:ss")
+        : String(ts);
+
+      return {
+        ok: true,
+        row: startRow + i,
+        tsISO: tsISO,
+        ymd: Number(ymd),
+        dWh: effDaily,
+        wWh: effWeekly,
+        mWh: effMonthly,
+        dWhPrev: (dailyWhPrev  > 0 ? dailyWhPrev  : lastPrevD) || 0,
+        wWhPrev: (weeklyWhPrev > 0 ? weeklyWhPrev : lastPrevW) || 0,
+        mWhPrev: (monthWhPrev  > 0 ? monthWhPrev  : lastPrevM) || 0
+      };
+    }
+  }
+  return { ok:false, reason:'NO_MEANINGFUL_DATA' };
+}
